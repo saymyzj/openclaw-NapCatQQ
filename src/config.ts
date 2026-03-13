@@ -27,6 +27,7 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
       autoIntervenePrompt: channel.autoIntervenePrompt,
       autoCheckIntervalMs: channel.autoCheckIntervalMs ?? 30000,
       autoCheckMessageThreshold: channel.autoCheckMessageThreshold ?? 10,
+      preCheckModel: channel.preCheckModel ?? "github-copilot/gpt-5-mini",
       requireMention: channel.requireMention ?? false,
       historyLimit: channel.historyLimit ?? 20,
       rateLimitMs: channel.rateLimitMs ?? 1000,
