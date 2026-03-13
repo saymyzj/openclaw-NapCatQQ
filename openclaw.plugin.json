@@ -47,6 +47,11 @@
         "default": 10,
         "description": "白名单群消息累积数量阈值，达到即触发巡检，默认 10 条"
       },
+      "preCheckModel": {
+        "type": "string",
+        "default": "github-copilot/gpt-5-mini",
+        "description": "定期巡检预筛选模型，先用便宜模型判断是否需要回复，再调用主模型生成内容"
+      },
       "historyLimit": {
         "type": "number",
         "default": 20,

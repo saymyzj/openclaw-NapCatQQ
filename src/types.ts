@@ -44,6 +44,7 @@ export interface NapCatConfig {
   autoIntervenePrompt?: string;
   autoCheckIntervalMs?: number;
   autoCheckMessageThreshold?: number;
+  preCheckModel?: string;
   requireMention?: boolean;
   historyLimit?: number;
   rateLimitMs?: number;

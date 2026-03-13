@@ -28,6 +28,7 @@ import {
   buildPeriodicCheckMessage,
   buildMentionContextPrompt,
 } from "./auto-intervene.js";
+import { preCheckWithCheapModel } from "../precheck.js";
 
 const DEFAULT_HISTORY_LIMIT = 20;
 export const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
@@ -198,9 +199,30 @@ async function dispatchPeriodicCheck(
       napCatCfg.autoIntervenePrompt,
     );
 
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: sending ${recentMessages.length} messages to AI`);
+    // ── 第一步：用便宜模型预筛选 ──
+    const gatewayPort = cfg?.gateway?.port ?? 18789;
+    const gatewayToken = cfg?.gateway?.auth?.token ?? "";
+    const preCheckModel = napCatCfg.preCheckModel ?? "github-copilot/gpt-5-mini";
 
-    // 使用最后一条消息的发送者作为 context sender
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: pre-screening with ${preCheckModel} (${recentMessages.length} msgs)`);
+
+    const preResult = await preCheckWithCheapModel(checkMessage, {
+      gatewayPort,
+      gatewayToken,
+      model: preCheckModel,
+      customPrompt: napCatCfg.autoIntervenePrompt,
+    });
+
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: precheck result=${preResult.shouldReply} reason=${preResult.reason}`);
+
+    if (!preResult.shouldReply) {
+      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: cheap model says NO, skipping main model`);
+      return;
+    }
+
+    // ── 第二步：便宜模型说 YES，调用主模型生成回复 ──
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: cheap model says YES, dispatching to main model`);
+
     const lastMsg = recentMessages[recentMessages.length - 1];
 
     await dispatchToAI(api, {
