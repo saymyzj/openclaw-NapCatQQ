@@ -1,18 +1,23 @@
 /**
  * 群聊自动介入判断模块
  *
- * 监控群聊消息，通过以下方式判断是否需要 AI 介入：
- * 1. 关键词匹配（配置的 autoInterveneKeywords）
- * 2. 直接 @机器人
- * 3. 累积消息上下文分析（通过 AI 判断是否有需要帮助的问题）
+ * 两种触发方式：
+ * 1. @机器人 → 任何群聊中都立即回复
+ * 2. 白名单群定期巡检 → 每 N 秒或 M 条消息后，把最近消息发给 AI 判断是否需要回复
  */
 
 import type { OneBotMessage, HistoryEntry } from "../types.js";
 import { getSenderName, getTextFromSegments, isMentioned } from "../message.js";
 
-/** 群聊消息缓冲区，用于上下文分析 */
+/** 群聊消息缓冲区 */
 const groupMessageBuffer = new Map<number, HistoryEntry[]>();
 const MAX_BUFFER_SIZE = 50;
+
+/** 定期巡检状态 */
+const groupCheckState = new Map<number, { lastCheckTime: number; messageCount: number }>();
+
+/** 正在巡检中的群（防止并发） */
+const groupCheckLock = new Set<number>();
 
 /** 记录群聊消息到缓冲区 */
 export function recordGroupMessage(groupId: number, msg: OneBotMessage): void {
@@ -28,7 +33,7 @@ export function recordGroupMessage(groupId: number, msg: OneBotMessage): void {
   if (buffer.length > MAX_BUFFER_SIZE) buffer.splice(0, buffer.length - MAX_BUFFER_SIZE);
 }
 
-/** 获取群聊最近消息（用于给 AI 提供上下文） */
+/** 获取群聊最近消息 */
 export function getRecentGroupMessages(groupId: number, limit = 10): HistoryEntry[] {
   const buffer = groupMessageBuffer.get(groupId) ?? [];
   return buffer.slice(-limit);
@@ -39,143 +44,87 @@ export function clearGroupBuffer(groupId: number): void {
   groupMessageBuffer.delete(groupId);
 }
 
-export interface InterveneDecision {
-  shouldIntervene: boolean;
-  reason: string;
-  context?: string;
-}
-
 /**
- * 判断是否需要介入群聊
+ * 判断白名单群是否应该执行定期巡检
  *
- * 检查优先级：
- * 1. @机器人 → 必须回复
- * 2. 关键词匹配 → 回复
- * 3. 上下文分析 → 检测求助、技术问题、争议等
+ * 触发条件（满足任一）：
+ * - 距上次巡检 >= autoCheckIntervalMs（默认 30s）且有 >= 2 条新消息
+ * - 新消息 >= autoCheckMessageThreshold（默认 10 条）
  */
-export function shouldIntervene(
-  msg: OneBotMessage,
-  selfId: number,
-  config: {
-    requireMention?: boolean;
-    autoIntervene?: boolean;
-    autoInterveneKeywords?: string[];
-    monitorGroups?: number[];
-  }
-): InterveneDecision {
-  const groupId = msg.group_id;
-  const text = (getTextFromSegments(msg) || String(msg.raw_message ?? "")).trim();
+export function shouldPerformPeriodicCheck(
+  groupId: number,
+  config: { autoCheckIntervalMs?: number; autoCheckMessageThreshold?: number }
+): boolean {
+  if (groupCheckLock.has(groupId)) return false;
 
-  // 检查是否在监控群列表中
-  if (config.monitorGroups && config.monitorGroups.length > 0) {
-    if (groupId && !config.monitorGroups.includes(groupId)) {
-      return { shouldIntervene: false, reason: "not_in_monitor_list" };
-    }
+  const state = groupCheckState.get(groupId);
+  if (!state) {
+    groupCheckState.set(groupId, { lastCheckTime: Date.now(), messageCount: 1 });
+    return false;
   }
 
-  // 1. @机器人 → 必须回复
-  if (isMentioned(msg, selfId)) {
-    return { shouldIntervene: true, reason: "mentioned" };
-  }
+  state.messageCount++;
 
-  // requireMention=true 时，只有 @才回复
-  if (config.requireMention) {
-    return { shouldIntervene: false, reason: "require_mention" };
-  }
+  const intervalMs = config.autoCheckIntervalMs ?? 30000;
+  const threshold = config.autoCheckMessageThreshold ?? 10;
 
-  // 2. 关键词匹配
-  if (config.autoInterveneKeywords && config.autoInterveneKeywords.length > 0) {
-    const lowerText = text.toLowerCase();
-    for (const kw of config.autoInterveneKeywords) {
-      if (lowerText.includes(kw.toLowerCase())) {
-        return { shouldIntervene: true, reason: "keyword", context: kw };
-      }
-    }
-  }
+  const timePassed = Date.now() - state.lastCheckTime >= intervalMs && state.messageCount >= 2;
+  const enoughMessages = state.messageCount >= threshold;
 
-  // 3. 自动介入：智能匹配模式
-  if (config.autoIntervene) {
-    // 求助模式匹配
-    const helpPatterns = [
-      /怎么(办|做|弄|搞|解决|处理|配置|设置|安装)/,
-      /如何/,
-      /有人(知道|了解|会|能)/,
-      /请问/,
-      /求(助|帮|教)/,
-      /帮(帮|个)忙/,
-      /谁(能|会|知道)/,
-      /为什么/,
-      /什么(原因|问题|情况)/,
-      /有没有(人|办法|方法)/,
-      /能不能/,
-      /可以吗/,
-      /出(错|问题|bug)/i,
-      /报错/,
-      /error/i,
-      /failed/i,
-      /crash/i,
-      /不(行|对|能|工作|运行|好使)/,
-      /挂了/,
-      /炸了/,
-      /help/i,
-      /how to/i,
-      /what('?s| is)/i,
-      /can('?t| not)/i,
-      /doesn('?t| not)/i,
-      /won('?t| not)/i,
-    ];
+  return timePassed || enoughMessages;
+}
 
-    for (const pattern of helpPatterns) {
-      if (pattern.test(text)) {
-        // 获取上下文来丰富判断
-        const recentMessages = getRecentGroupMessages(groupId!, 5);
-        const contextSummary = recentMessages
-          .map((e) => `${e.senderName}: ${e.body}`)
-          .join("\n");
-        return {
-          shouldIntervene: true,
-          reason: "auto_detect",
-          context: contextSummary || text,
-        };
-      }
-    }
-  }
+/** 标记巡检开始（加锁） */
+export function lockPeriodicCheck(groupId: number): void {
+  groupCheckLock.add(groupId);
+}
 
-  return { shouldIntervene: false, reason: "no_trigger" };
+/** 标记巡检完成（解锁 + 重置计数） */
+export function markPeriodicCheckDone(groupId: number): void {
+  groupCheckLock.delete(groupId);
+  groupCheckState.set(groupId, { lastCheckTime: Date.now(), messageCount: 0 });
+}
+
+/** 检查群是否在白名单中 */
+export function isMonitoredGroup(groupId: number, monitorGroups: number[]): boolean {
+  if (!monitorGroups || monitorGroups.length === 0) return false;
+  return monitorGroups.includes(groupId);
 }
 
 /**
- * 构建自动介入时的系统提示词
+ * 构建定期巡检时发给 AI 的消息体
  */
-export function buildAutoInterveneSystemPrompt(
-  decision: InterveneDecision,
-  customPrompt?: string,
-  recentMessages?: HistoryEntry[]
+export function buildPeriodicCheckMessage(
+  groupId: number,
+  recentMessages: HistoryEntry[],
+  customPrompt?: string
 ): string {
-  const contextBlock = recentMessages?.length
-    ? `\n\n以下是群聊最近的对话记录，请参考上下文进行回复：\n${recentMessages.map((e) => `[${e.senderName}]: ${e.body}`).join("\n")}`
-    : "";
+  const lines = recentMessages.map((e) => {
+    const time = new Date(e.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    return `[${e.senderName} ${time}]: ${e.body}`;
+  });
 
-  if (customPrompt) {
-    return `${customPrompt}${contextBlock}`;
-  }
+  return `[群聊消息巡检 - 群${groupId}]\n` +
+    `以下是最近的群聊消息记录。请判断是否有你可以帮助回答的问题或有价值的参与点。\n` +
+    `如果需要回复，直接给出自然的回复内容（像一个有经验的群友那样）。\n` +
+    `如果不需要回复，回复 NO_REPLY。\n` +
+    (customPrompt ? `\n额外指引：${customPrompt}\n` : "") +
+    `\n${lines.join("\n")}`;
+}
 
-  const basePrompt = `你是一个群聊AI助手。你正在监控群聊消息，当检测到有人需要帮助或有问题需要解答时自动介入。
+/**
+ * 构建 @机器人 时的上下文消息
+ */
+export function buildMentionContextPrompt(
+  recentMessages: HistoryEntry[],
+  customPrompt?: string
+): string {
+  if (!recentMessages?.length) return customPrompt ?? "";
 
-规则：
-1. 只在确实能提供有价值帮助时才回复
-2. 回复要简洁、有针对性，不要太长
-3. 如果不确定答案，诚实说明，不要编造
-4. 语气自然友好，像一个有经验的群友
-5. 如果是闲聊或不需要帮助的内容，回复 NO_REPLY`;
+  const contextBlock = recentMessages
+    .map((e) => `[${e.senderName}]: ${e.body}`)
+    .join("\n");
 
-  if (decision.reason === "mentioned") {
-    return `${basePrompt}\n\n用户直接@了你，请回复他们的问题。${contextBlock}`;
-  }
-
-  if (decision.reason === "keyword") {
-    return `${basePrompt}\n\n检测到关键词「${decision.context}」触发了自动介入。请判断是否需要帮助并给出回复。如果这条消息不需要你回复，请直接回复 NO_REPLY。${contextBlock}`;
-  }
-
-  return `${basePrompt}\n\n检测到群友可能需要帮助。请判断是否需要介入。如果这条消息不需要你回复，请直接回复 NO_REPLY。${contextBlock}`;
+  const base = customPrompt ?? "你是一个群聊AI助手，用户直接@了你，请回复他们的问题。回复要简洁有针对性。";
+  return `${base}\n\n以下是群聊最近的对话记录，请参考上下文进行回复：\n${contextBlock}`;
 }

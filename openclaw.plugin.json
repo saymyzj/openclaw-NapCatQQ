@@ -2,7 +2,7 @@
   "id": "openclaw-napcat",
   "name": "NapCat QQ Channel",
   "version": "1.0.0",
-  "description": "NapCat (OneBot v11) channel plugin — QQ group chat monitoring with AI auto-intervention",
+  "description": "NapCat (OneBot v11) channel plugin — any group @mention instant reply + whitelisted group periodic patrol",
   "channels": ["napcat"],
   "skills": ["skills/napcat-ops"],
   "capabilities": {
@@ -21,31 +21,36 @@
       "monitorGroups": {
         "type": "array",
         "items": { "type": "number" },
-        "description": "需要监控的群号列表，为空则监控所有群"
+        "description": "白名单群号列表，这些群会定期巡检并让 AI 判断是否参与。空数组 = 不主动监控，仅响应 @"
       },
       "autoIntervene": {
         "type": "boolean",
         "default": true,
-        "description": "是否启用自动介入（AI 根据群聊内容判断是否需要回复）"
+        "description": "是否启用白名单群的定期巡检（需配合 monitorGroups 使用）"
       },
       "autoInterveneKeywords": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "触发自动介入的关键词列表"
+        "description": "触发自动介入的关键词列表（备用，巡检时 AI 自行判断）"
       },
       "autoIntervenePrompt": {
         "type": "string",
-        "description": "自动介入时使用的系统提示词，用于判断是否需要介入"
+        "description": "巡检时附加给 AI 的额外指引提示词"
       },
-      "requireMention": {
-        "type": "boolean",
-        "default": false,
-        "description": "群聊是否必须 @ 机器人才回复（false 则配合 autoIntervene 自动判断）"
+      "autoCheckIntervalMs": {
+        "type": "number",
+        "default": 30000,
+        "description": "白名单群巡检时间间隔（毫秒），默认 30 秒"
+      },
+      "autoCheckMessageThreshold": {
+        "type": "number",
+        "default": 10,
+        "description": "白名单群消息累积数量阈值，达到即触发巡检，默认 10 条"
       },
       "historyLimit": {
         "type": "number",
         "default": 20,
-        "description": "保留的历史消息条数"
+        "description": "会话历史保留条数"
       },
       "rateLimitMs": {
         "type": "number",
@@ -55,12 +60,12 @@
       "renderMarkdownToPlain": {
         "type": "boolean",
         "default": true,
-        "description": "是否将 Markdown 转为纯文本再发送"
+        "description": "是否将 AI 回复中的 Markdown 转为纯文本再发送"
       },
       "whitelistUserIds": {
         "type": "array",
         "items": { "type": "number" },
-        "description": "白名单 QQ 号，为空则所有人可触发"
+        "description": "私聊白名单 QQ 号，空数组 = 所有人可私聊"
       },
       "admins": {
         "type": "array",
@@ -73,8 +78,10 @@
     "accessToken": { "label": "Access Token", "sensitive": true },
     "host": { "label": "主机地址", "placeholder": "127.0.0.1" },
     "port": { "label": "端口", "placeholder": "3001" },
-    "monitorGroups": { "label": "监控群号列表" },
-    "autoIntervene": { "label": "启用自动介入" },
-    "requireMention": { "label": "需要 @ 才回复" }
+    "monitorGroups": { "label": "白名单群号（定期巡检）" },
+    "autoIntervene": { "label": "启用定期巡检" },
+    "autoCheckIntervalMs": { "label": "巡检间隔（毫秒）", "placeholder": "30000" },
+    "autoCheckMessageThreshold": { "label": "巡检消息阈值", "placeholder": "10" },
+    "whitelistUserIds": { "label": "私聊白名单 QQ 号" }
   }
 }

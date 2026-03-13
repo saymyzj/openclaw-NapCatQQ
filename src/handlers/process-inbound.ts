@@ -1,5 +1,14 @@
 /**
  * 入站消息处理 — 接收 NapCat 消息并分发给 AI
+ *
+ * 群聊逻辑：
+ *   1. @机器人 → 任何群都立即回复
+ *   2. 白名单群（monitorGroups）→ 定期巡检（每 30s 或 10 条消息），批量发给 AI 判断
+ *   3. 其他 → 静默
+ *
+ * 私聊逻辑：
+ *   - whitelistUserIds 非空时只处理白名单用户
+ *   - 否则处理所有私聊
  */
 
 import type { OneBotMessage } from "../types.js";
@@ -9,7 +18,16 @@ import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, setMsgE
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId } from "../reply-context.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
-import { shouldIntervene, recordGroupMessage, getRecentGroupMessages, buildAutoInterveneSystemPrompt } from "./auto-intervene.js";
+import {
+  recordGroupMessage,
+  getRecentGroupMessages,
+  isMonitoredGroup,
+  shouldPerformPeriodicCheck,
+  lockPeriodicCheck,
+  markPeriodicCheckDone,
+  buildPeriodicCheckMessage,
+  buildMentionContextPrompt,
+} from "./auto-intervene.js";
 
 const DEFAULT_HISTORY_LIMIT = 20;
 export const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
@@ -31,67 +49,226 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   }
 
   const selfId = msg.self_id ?? 0;
+  const cfg = api.config;
+  const napCatCfg = cfg?.channels?.napcat ?? {};
+
+  // ─── 详细日志：记录收到的原始消息 ───
+  const _senderName = getSenderName(msg);
+  const _rawText = getRawText(msg);
+  const _msgType = msg.message_type ?? "unknown";
+  const _groupId = msg.group_id ?? "";
+  const _segments = msg.message?.map((s: any) => `${s.type}${s.data ? ":" + JSON.stringify(s.data).slice(0, 80) : ""}`).join(", ") ?? "";
+  api.logger?.info?.(`[napcat] ◀ recv ${_msgType} from ${msg.user_id}(${_senderName})${_groupId ? ` in group ${_groupId}` : ""}: "${_rawText.slice(0, 100)}" [segments: ${_segments}]`);
+
   // 忽略自己发的消息
   if (msg.user_id != null && Number(msg.user_id) === Number(selfId)) return;
 
   const isGroup = msg.message_type === "group";
-  const cfg = api.config;
-  const napCatCfg = cfg?.channels?.napcat ?? {};
 
-  // ─── 群聊自动介入判断 ───
+  // ═══════════════════════════════════════════
+  // 群聊处理
+  // ═══════════════════════════════════════════
   if (isGroup) {
-    // 记录所有群消息到缓冲区（用于上下文分析）
-    recordGroupMessage(msg.group_id!, msg);
+    const groupId = msg.group_id!;
+    recordGroupMessage(groupId, msg);
 
-    const decision = shouldIntervene(msg, selfId, {
-      requireMention: napCatCfg.requireMention ?? false,
-      autoIntervene: napCatCfg.autoIntervene ?? true,
-      autoInterveneKeywords: napCatCfg.autoInterveneKeywords ?? [],
-      monitorGroups: napCatCfg.monitorGroups ?? [],
-    });
+    const mentioned = isMentioned(msg, selfId);
+    const monitored = isMonitoredGroup(groupId, napCatCfg.monitorGroups ?? []);
 
-    if (!decision.shouldIntervene) {
-      api.logger?.info?.(`[napcat] skip group msg: ${decision.reason}`);
+    if (mentioned) {
+      // ── @机器人：任何群都立即回复 ──
+      api.logger?.info?.(`[napcat] @mentioned in group ${groupId}, processing immediately`);
+      await dispatchGroupMention(api, msg, runtime, cfg, napCatCfg, config, selfId);
       return;
     }
 
-    api.logger?.info?.(`[napcat] intervene: reason=${decision.reason} context=${decision.context?.slice(0, 50) ?? ""}`);
+    if (monitored && napCatCfg.autoIntervene !== false) {
+      // ── 白名单群：检查是否该执行定期巡检 ──
+      const shouldCheck = shouldPerformPeriodicCheck(groupId, {
+        autoCheckIntervalMs: napCatCfg.autoCheckIntervalMs ?? 30000,
+        autoCheckMessageThreshold: napCatCfg.autoCheckMessageThreshold ?? 10,
+      });
+
+      if (shouldCheck) {
+        api.logger?.info?.(`[napcat] periodic check triggered for group ${groupId}`);
+        // 异步执行巡检，不阻塞消息处理
+        dispatchPeriodicCheck(api, groupId, runtime, cfg, napCatCfg, config).catch((e) => {
+          api.logger?.error?.(`[napcat] periodic check failed for group ${groupId}: ${e?.message}`);
+        });
+      } else {
+        api.logger?.info?.(`[napcat] group ${groupId} monitored, buffering (no check yet)`);
+      }
+      return;
+    }
+
+    // 非白名单群 + 没有 @ → 忽略
+    api.logger?.info?.(`[napcat] group ${groupId} not monitored and not mentioned, skipping`);
+    return;
   }
 
-  // ─── 提取消息文本 ───
+  // ═══════════════════════════════════════════
+  // 私聊处理
+  // ═══════════════════════════════════════════
+  const userId = msg.user_id!;
+  const whitelist = getWhitelistUserIds(cfg);
+  if (whitelist.length > 0 && !whitelist.includes(Number(userId))) {
+    api.logger?.info?.(`[napcat] user ${userId} not in whitelist, skipping private msg`);
+    return;
+  }
+
+  const messageText = await extractMessageText(msg);
+  if (!messageText?.trim()) {
+    api.logger?.info?.("[napcat] ignoring empty private message");
+    return;
+  }
+
+  await dispatchToAI(api, {
+    runtime, cfg, napCatCfg, config,
+    userId, groupId: undefined, isGroup: false,
+    senderName: getSenderName(msg),
+    messageText,
+    messageId: msg.message_id,
+  });
+}
+
+// ─────────────────────────────────────────────
+// @机器人 的群聊即时回复
+// ─────────────────────────────────────────────
+async function dispatchGroupMention(
+  api: any,
+  msg: OneBotMessage,
+  runtime: any,
+  cfg: any,
+  napCatCfg: any,
+  config: any,
+  selfId: number,
+): Promise<void> {
+  const messageText = await extractMessageText(msg);
+  if (!messageText?.trim()) {
+    api.logger?.info?.("[napcat] ignoring empty @mention message");
+    return;
+  }
+
+  const groupId = msg.group_id!;
+  const senderName = getSenderName(msg);
+
+  // 附加群聊上下文
+  const recentMessages = getRecentGroupMessages(groupId, 10);
+  let enrichedText = messageText;
+  if (recentMessages.length > 1) {
+    const contextLines = recentMessages
+      .slice(0, -1)
+      .map((e) => `[${e.senderName}]: ${e.body}`)
+      .join("\n");
+    enrichedText = `[群聊上下文]\n${contextLines}\n\n[当前消息]\n${senderName}: ${messageText}`;
+  }
+
+  await dispatchToAI(api, {
+    runtime, cfg, napCatCfg, config,
+    userId: msg.user_id!, groupId, isGroup: true,
+    senderName,
+    messageText: enrichedText,
+    rawMessageText: messageText,
+    messageId: msg.message_id,
+  });
+}
+
+// ─────────────────────────────────────────────
+// 白名单群定期巡检
+// ─────────────────────────────────────────────
+async function dispatchPeriodicCheck(
+  api: any,
+  groupId: number,
+  runtime: any,
+  cfg: any,
+  napCatCfg: any,
+  config: any,
+): Promise<void> {
+  lockPeriodicCheck(groupId);
+  try {
+    const recentMessages = getRecentGroupMessages(groupId, 15);
+    if (recentMessages.length < 2) {
+      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: not enough messages, skipping`);
+      return;
+    }
+
+    const checkMessage = buildPeriodicCheckMessage(
+      groupId,
+      recentMessages,
+      napCatCfg.autoIntervenePrompt,
+    );
+
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: sending ${recentMessages.length} messages to AI`);
+
+    // 使用最后一条消息的发送者作为 context sender
+    const lastMsg = recentMessages[recentMessages.length - 1];
+
+    await dispatchToAI(api, {
+      runtime, cfg, napCatCfg, config,
+      userId: Number(lastMsg.sender) || 0,
+      groupId,
+      isGroup: true,
+      senderName: "群聊巡检",
+      messageText: checkMessage,
+      rawMessageText: checkMessage,
+      messageId: undefined,
+      isPeriodicCheck: true,
+    });
+  } finally {
+    markPeriodicCheckDone(groupId);
+  }
+}
+
+// ─────────────────────────────────────────────
+// 提取消息文本（含引用处理）
+// ─────────────────────────────────────────────
+async function extractMessageText(msg: OneBotMessage): Promise<string> {
   const replyId = getReplyMessageId(msg);
-  let messageText: string;
   if (replyId != null) {
     const userText = getTextFromSegments(msg);
     try {
       const quoted = await getMsg(replyId);
       const quotedText = quoted ? getTextFromMessageContent(quoted.message) : "";
       const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
-      messageText = quotedText.trim()
+      return quotedText.trim()
         ? `[引用 ${String(senderLabel)} 的消息：${quotedText.trim()}]\n${userText}`
         : userText;
     } catch {
-      messageText = userText;
+      return userText;
     }
-  } else {
-    messageText = getRawText(msg);
   }
+  return getRawText(msg);
+}
 
-  if (!messageText?.trim()) {
-    api.logger?.info?.("[napcat] ignoring empty message");
-    return;
-  }
+// ─────────────────────────────────────────────
+// 核心：分发给 AI 并处理回复
+// ─────────────────────────────────────────────
+async function dispatchToAI(
+  api: any,
+  opts: {
+    runtime: any;
+    cfg: any;
+    napCatCfg: any;
+    config: any;
+    userId: number;
+    groupId: number | undefined;
+    isGroup: boolean;
+    senderName: string;
+    messageText: string;
+    rawMessageText?: string;
+    messageId: number | undefined;
+    isPeriodicCheck?: boolean;
+  },
+): Promise<void> {
+  const {
+    runtime, cfg, napCatCfg, config,
+    userId, groupId, isGroup,
+    senderName, messageText,
+    messageId, isPeriodicCheck,
+  } = opts;
+  const rawMessageText = opts.rawMessageText ?? messageText;
+  const { buildPendingHistoryContextFromMap, recordPendingHistoryEntry, clearHistoryEntriesIfEnabled } = getSdk();
 
-  // ─── 白名单检查 ───
-  const userId = msg.user_id!;
-  const whitelist = getWhitelistUserIds(cfg);
-  if (whitelist.length > 0 && !whitelist.includes(Number(userId))) {
-    api.logger?.info?.(`[napcat] user ${userId} not in whitelist`);
-    return;
-  }
-
-  // ─── 构建会话上下文 ───
-  const groupId = msg.group_id;
   const sessionId = isGroup
     ? `napcat:group:${groupId}`.toLowerCase()
     : `napcat:${userId}`.toLowerCase();
@@ -109,32 +286,18 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const chatType = isGroup ? "group" : "direct";
-  const senderName = getSenderName(msg);
   const fromLabel = senderName;
-
-  // 自动介入时附加群聊上下文
-  let enrichedMessageText = messageText;
-  if (isGroup && napCatCfg.autoIntervene) {
-    const recentMessages = getRecentGroupMessages(groupId!, 10);
-    if (recentMessages.length > 1) {
-      const contextLines = recentMessages
-        .slice(0, -1) // 排除当前消息
-        .map((e) => `[${e.senderName}]: ${e.body}`)
-        .join("\n");
-      enrichedMessageText = `[群聊上下文]\n${contextLines}\n\n[当前消息]\n${senderName}: ${messageText}`;
-    }
-  }
 
   const formattedBody =
     runtime.channel.reply?.formatInboundEnvelope?.({
       channel: "NapCat",
       from: fromLabel,
       timestamp: Date.now(),
-      body: enrichedMessageText,
+      body: messageText,
       chatType,
       sender: { name: fromLabel, id: String(userId) },
       envelope: envelopeOptions,
-    }) ?? { content: [{ type: "text", text: enrichedMessageText }] };
+    }) ?? { content: [{ type: "text", text: messageText }] };
 
   const body = buildPendingHistoryContextFromMap
     ? buildPendingHistoryContextFromMap({
@@ -155,13 +318,13 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       })
     : formattedBody;
 
-  if (recordPendingHistoryEntry) {
+  if (recordPendingHistoryEntry && !isPeriodicCheck) {
     recordPendingHistoryEntry({
       historyMap: sessionHistories,
       historyKey: sessionId,
       entry: {
         sender: fromLabel,
-        body: messageText,
+        body: rawMessageText,
         timestamp: Date.now(),
         messageId: `napcat-${Date.now()}`,
       },
@@ -173,7 +336,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   const replyTarget = isGroup ? `napcat:group:${groupId}` : `napcat:${userId}`;
   const ctxPayload = {
     Body: body,
-    RawBody: messageText,
+    RawBody: rawMessageText,
     From: replyTarget,
     To: replyTarget,
     SessionKey: sessionId,
@@ -211,25 +374,24 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     runtime.channel.activity.record({ channel: "napcat", accountId: config.accountId ?? "default", direction: "inbound" });
   }
 
-  // ─── 思考表情 ───
-  const userMessageId = msg.message_id;
+  // ─── 思考表情（巡检时不加） ───
   let emojiAdded = false;
-  if (userMessageId != null) {
+  if (messageId != null && !isPeriodicCheck) {
     try {
-      await setMsgEmojiLike(userMessageId, 60, true);
+      await setMsgEmojiLike(messageId, 60, true);
       emojiAdded = true;
     } catch { /* not supported */ }
   }
 
   const clearEmoji = async () => {
-    if (emojiAdded && userMessageId != null) {
-      try { await setMsgEmojiLike(userMessageId, 60, false); } catch { }
+    if (emojiAdded && messageId != null) {
+      try { await setMsgEmojiLike(messageId, 60, false); } catch { }
       emojiAdded = false;
     }
   };
 
   // ─── 分发消息给 AI 并处理回复 ───
-  api.logger?.info?.(`[napcat] dispatching message for session ${sessionId}`);
+  api.logger?.info?.(`[napcat] ▶ dispatching to AI for session ${sessionId}${isPeriodicCheck ? " (periodic check)" : ""}, text="${messageText.slice(0, 100)}"`);
 
   setActiveReplyTarget(replyTarget);
   const replySessionId = `napcat-reply-${Date.now()}-${sessionId}`;
@@ -250,25 +412,56 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
           const mediaUrl = typeof p === "string" ? undefined : (p?.mediaUrl ?? p?.mediaUrls?.[0]);
           const trimmed = (replyText || "").trim();
 
+          api.logger?.info?.(`[napcat] ▶ AI reply (kind=${info.kind}): text="${trimmed.slice(0, 120)}" mediaUrl=${mediaUrl ?? "none"}`);
+
           // NO_REPLY 表示 AI 认为不需要回复
-          if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY")) && !mediaUrl) return;
+          if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY")) && !mediaUrl) {
+            api.logger?.info?.(`[napcat] ▶ AI replied NO_REPLY, skipping`);
+            return;
+          }
 
           const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
 
+          // 从文本中提取 markdown 图片和裸图片 URL
+          const imageUrlsFromText: string[] = [];
+          let textWithoutImages = trimmed;
+
+          // 提取 markdown 图片 ![alt](url)
+          const mdImageRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+          let mdMatch: RegExpExecArray | null;
+          while ((mdMatch = mdImageRegex.exec(trimmed)) !== null) {
+            const url = mdMatch[1];
+            if (/^https?:\/\//i.test(url)) imageUrlsFromText.push(url);
+          }
+          textWithoutImages = textWithoutImages.replace(mdImageRegex, "").trim();
+
+          // 提取裸图片 URL（以常见图片扩展名结尾）
+          const bareImageUrlRegex = /(?:^|\s)(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp|bmp)(?:\?\S*)?)/gi;
+          let bareMatch: RegExpExecArray | null;
+          while ((bareMatch = bareImageUrlRegex.exec(textWithoutImages)) !== null) {
+            const url = bareMatch[1];
+            if (!imageUrlsFromText.includes(url)) imageUrlsFromText.push(url);
+          }
+          if (imageUrlsFromText.length > 0) {
+            textWithoutImages = textWithoutImages.replace(bareImageUrlRegex, "").trim();
+          }
+
+          const allImageUrls = [...(mediaUrl ? [mediaUrl] : []), ...imageUrlsFromText];
+
           const usePlain = getRenderMarkdownToPlain(cfg);
-          let textPlain = usePlain ? markdownToPlain(trimmed) : trimmed;
+          let textPlain = usePlain
+            ? markdownToPlain(allImageUrls.length > 0 ? textWithoutImages : trimmed)
+            : (allImageUrls.length > 0 ? textWithoutImages : trimmed);
           textPlain = collapseDoubleNewlines(textPlain);
 
           try {
-            // 发送文本
             if (textPlain) {
               if (ig && gid) await sendGroupMsg(gid, textPlain, getConfig);
               else if (uid) await sendPrivateMsg(uid, textPlain, getConfig);
             }
-            // 发送媒体
-            if (mediaUrl) {
-              if (ig && gid) await sendGroupImage(gid, mediaUrl, getConfig);
-              else if (uid) await sendPrivateImage(uid, mediaUrl, getConfig);
+            for (const imgUrl of allImageUrls) {
+              if (ig && gid) await sendGroupImage(gid, imgUrl, getConfig);
+              else if (uid) await sendPrivateImage(uid, imgUrl, getConfig);
             }
           } catch (e: any) {
             api.logger?.error?.(`[napcat] deliver failed: ${e?.message}`);
@@ -291,11 +484,13 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   } catch (err: any) {
     await clearEmoji();
     api.logger?.error?.(`[napcat] dispatch failed: ${err?.message}`);
-    try {
-      const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
-      if (ig && gid) await sendGroupMsg(gid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
-      else if (uid) await sendPrivateMsg(uid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
-    } catch { }
+    if (!isPeriodicCheck) {
+      try {
+        const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
+        if (ig && gid) await sendGroupMsg(gid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+        else if (uid) await sendPrivateMsg(uid, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+      } catch { }
+    }
   } finally {
     setActiveReplySessionId(null);
     clearActiveReplyTarget();

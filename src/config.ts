@@ -25,6 +25,8 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
       autoIntervene: channel.autoIntervene ?? true,
       autoInterveneKeywords: channel.autoInterveneKeywords ?? [],
       autoIntervenePrompt: channel.autoIntervenePrompt,
+      autoCheckIntervalMs: channel.autoCheckIntervalMs ?? 30000,
+      autoCheckMessageThreshold: channel.autoCheckMessageThreshold ?? 10,
       requireMention: channel.requireMention ?? false,
       historyLimit: channel.historyLimit ?? 20,
       rateLimitMs: channel.rateLimitMs ?? 1000,
