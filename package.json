@@ -1,0 +1,49 @@
+{
+  "name": "openclaw-napcat",
+  "version": "1.0.0",
+  "description": "NapCat (OneBot v11) channel plugin for OpenClaw — QQ group monitoring with auto-intervention",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": "./dist/index.js",
+  "files": [
+    "dist",
+    "skills",
+    "openclaw.plugin.json"
+  ],
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "skills": ["skills/napcat-ops"],
+    "channel": {
+      "id": "napcat",
+      "label": "NapCat",
+      "selectionLabel": "NapCat (QQ OneBot v11)",
+      "docsPath": "/channels/napcat",
+      "blurb": "NapCat OneBot v11 via WebSocket — QQ group monitoring with auto-intervention",
+      "order": 80,
+      "aliases": ["qq", "napcat", "onebot"]
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

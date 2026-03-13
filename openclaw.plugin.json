@@ -1,0 +1,80 @@
+{
+  "id": "openclaw-napcat",
+  "name": "NapCat QQ Channel",
+  "version": "1.0.0",
+  "description": "NapCat (OneBot v11) channel plugin — QQ group chat monitoring with AI auto-intervention",
+  "channels": ["napcat"],
+  "skills": ["skills/napcat-ops"],
+  "capabilities": {
+    "proactiveMessaging": true,
+    "groupMonitoring": true,
+    "autoIntervention": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "host": { "type": "string", "description": "NapCat WebSocket 主机地址", "default": "127.0.0.1" },
+      "port": { "type": "number", "description": "NapCat WebSocket 端口", "default": 3001 },
+      "accessToken": { "type": "string", "description": "NapCat access token（可选）" },
+      "path": { "type": "string", "description": "WebSocket 路径", "default": "/" },
+      "monitorGroups": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "需要监控的群号列表，为空则监控所有群"
+      },
+      "autoIntervene": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否启用自动介入（AI 根据群聊内容判断是否需要回复）"
+      },
+      "autoInterveneKeywords": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "触发自动介入的关键词列表"
+      },
+      "autoIntervenePrompt": {
+        "type": "string",
+        "description": "自动介入时使用的系统提示词，用于判断是否需要介入"
+      },
+      "requireMention": {
+        "type": "boolean",
+        "default": false,
+        "description": "群聊是否必须 @ 机器人才回复（false 则配合 autoIntervene 自动判断）"
+      },
+      "historyLimit": {
+        "type": "number",
+        "default": 20,
+        "description": "保留的历史消息条数"
+      },
+      "rateLimitMs": {
+        "type": "number",
+        "default": 1000,
+        "description": "消息发送间隔（毫秒），防止被限制"
+      },
+      "renderMarkdownToPlain": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否将 Markdown 转为纯文本再发送"
+      },
+      "whitelistUserIds": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "白名单 QQ 号，为空则所有人可触发"
+      },
+      "admins": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "管理员 QQ 号列表"
+      }
+    }
+  },
+  "uiHints": {
+    "accessToken": { "label": "Access Token", "sensitive": true },
+    "host": { "label": "主机地址", "placeholder": "127.0.0.1" },
+    "port": { "label": "端口", "placeholder": "3001" },
+    "monitorGroups": { "label": "监控群号列表" },
+    "autoIntervene": { "label": "启用自动介入" },
+    "requireMention": { "label": "需要 @ 才回复" }
+  }
+}
