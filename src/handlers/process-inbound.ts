@@ -27,6 +27,7 @@ import {
   markPeriodicCheckDone,
   buildPeriodicCheckMessage,
   buildMentionContextPrompt,
+  scheduleTimerCheck,
 } from "./auto-intervene.js";
 import { preCheckWithCheapModel } from "../precheck.js";
 
@@ -98,6 +99,14 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         });
       } else {
         api.logger?.info?.(`[napcat] group ${groupId} monitored, buffering (no check yet)`);
+        // 设置定时器：到 autoCheckIntervalMs 后主动触发巡检
+        const checkIntervalMs = napCatCfg.autoCheckIntervalMs ?? 30000;
+        scheduleTimerCheck(groupId, checkIntervalMs, () => {
+          api.logger?.info?.(`[napcat] timer-triggered periodic check for group ${groupId}`);
+          dispatchPeriodicCheck(api, groupId, runtime, cfg, napCatCfg, config).catch((e) => {
+            api.logger?.error?.(`[napcat] timer periodic check failed for group ${groupId}: ${e?.message}`);
+          });
+        });
       }
       return;
     }

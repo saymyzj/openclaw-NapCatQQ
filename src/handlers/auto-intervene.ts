@@ -19,6 +19,12 @@ const groupCheckState = new Map<number, { lastCheckTime: number; messageCount: n
 /** 正在巡检中的群（防止并发） */
 const groupCheckLock = new Set<number>();
 
+/** 定时巡检 timer，到时间后主动触发 */
+const groupTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+/** 定时巡检回调注册表 */
+const groupTimerCallbacks = new Map<number, () => void>();
+
 /** 记录群聊消息到缓冲区 */
 export function recordGroupMessage(groupId: number, msg: OneBotMessage): void {
   if (!groupMessageBuffer.has(groupId)) groupMessageBuffer.set(groupId, []);
@@ -79,10 +85,54 @@ export function lockPeriodicCheck(groupId: number): void {
   groupCheckLock.add(groupId);
 }
 
-/** 标记巡检完成（解锁 + 重置计数） */
+/** 标记巡检完成（解锁 + 重置计数 + 清除 timer） */
 export function markPeriodicCheckDone(groupId: number): void {
   groupCheckLock.delete(groupId);
   groupCheckState.set(groupId, { lastCheckTime: Date.now(), messageCount: 0 });
+  clearTimerCheck(groupId);
+}
+
+/**
+ * 注册定时巡检回调 — 当消息缓存了但条件未满足时，设置一个 timer
+ * 到达 intervalMs 后主动触发巡检
+ */
+export function scheduleTimerCheck(
+  groupId: number,
+  intervalMs: number,
+  callback: () => void,
+): void {
+  // 已有 timer 或正在巡检中，不重复设置
+  if (groupTimers.has(groupId) || groupCheckLock.has(groupId)) return;
+
+  const state = groupCheckState.get(groupId);
+  if (!state || state.messageCount < 1) return;
+
+  // 计算距离条件满足还需要多久
+  const elapsed = Date.now() - state.lastCheckTime;
+  const remaining = Math.max(intervalMs - elapsed, 1000); // 至少 1 秒
+
+  groupTimerCallbacks.set(groupId, callback);
+  const timer = setTimeout(() => {
+    groupTimers.delete(groupId);
+    groupTimerCallbacks.delete(groupId);
+    // timer 触发时再次检查状态
+    const s = groupCheckState.get(groupId);
+    if (s && s.messageCount >= 2 && !groupCheckLock.has(groupId)) {
+      callback();
+    }
+  }, remaining);
+
+  groupTimers.set(groupId, timer);
+}
+
+/** 取消定时巡检 timer（巡检完成后调用） */
+export function clearTimerCheck(groupId: number): void {
+  const timer = groupTimers.get(groupId);
+  if (timer) {
+    clearTimeout(timer);
+    groupTimers.delete(groupId);
+  }
+  groupTimerCallbacks.delete(groupId);
 }
 
 /** 检查群是否在白名单中 */
