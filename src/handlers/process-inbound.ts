@@ -14,7 +14,7 @@
 import type { OneBotMessage } from "../types.js";
 import { getNapCatConfig, getRenderMarkdownToPlain, getWhitelistUserIds } from "../config.js";
 import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageContent, isMentioned, getSenderName } from "../message.js";
-import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, setMsgEmojiLike, getMsg } from "../connection.js";
+import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg } from "../connection.js";
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId } from "../reply-context.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
@@ -365,7 +365,7 @@ async function dispatchToAI(
       storePath,
       sessionKey: sessionId,
       ctx: ctxPayload,
-      updateLastRoute: !isGroup ? { sessionKey: sessionId, channel: "napcat", to: String(userId), accountId: config.accountId ?? "default" } : undefined,
+      updateLastRoute: { sessionKey: sessionId, channel: "napcat", to: isGroup ? `group:${groupId}` : String(userId), accountId: config.accountId ?? "default" },
       onRecordError: (err: any) => api.logger?.warn?.(`[napcat] recordInboundSession: ${err}`),
     });
   }
@@ -422,20 +422,56 @@ async function dispatchToAI(
 
           const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
 
-          // 从文本中提取 markdown 图片和裸图片 URL
-          const imageUrlsFromText: string[] = [];
-          let textWithoutImages = trimmed;
+          // ── 1. 提取 <qqimg>/<qqvideo>/<qqfile> 标签 ──
+          const qqImages: string[] = [];
+          const qqVideos: string[] = [];
+          const qqFiles: string[] = [];
+          let cleanedText = trimmed;
 
-          // 提取 markdown 图片 ![alt](url)
+          // <qqimg>path_or_url</qqimg> (及常见变体 qqimage, qq_img 等)
+          const qqImgRegex = /<\s*qq(?:img|image|pic|_img)\s*>([\s\S]*?)<\s*\/\s*qq(?:img|image|pic|_img)\s*>/gi;
+          let qqMatch: RegExpExecArray | null;
+          while ((qqMatch = qqImgRegex.exec(cleanedText)) !== null) {
+            const val = qqMatch[1].trim();
+            if (val) qqImages.push(val);
+          }
+          cleanedText = cleanedText.replace(qqImgRegex, "").trim();
+
+          // <qqvideo>path_or_url</qqvideo>
+          const qqVideoRegex = /<\s*qqvideo\s*>([\s\S]*?)<\s*\/\s*qqvideo\s*>/gi;
+          while ((qqMatch = qqVideoRegex.exec(cleanedText)) !== null) {
+            const val = qqMatch[1].trim();
+            if (val) qqVideos.push(val);
+          }
+          cleanedText = cleanedText.replace(qqVideoRegex, "").trim();
+
+          // <qqfile>path_or_url</qqfile>
+          const qqFileRegex = /<\s*qqfile\s*>([\s\S]*?)<\s*\/\s*qqfile\s*>/gi;
+          while ((qqMatch = qqFileRegex.exec(cleanedText)) !== null) {
+            const val = qqMatch[1].trim();
+            if (val) qqFiles.push(val);
+          }
+          cleanedText = cleanedText.replace(qqFileRegex, "").trim();
+
+          const hasQqTags = qqImages.length > 0 || qqVideos.length > 0 || qqFiles.length > 0;
+          if (hasQqTags) {
+            api.logger?.info?.(`[napcat] extracted qq tags: ${qqImages.length} images, ${qqVideos.length} videos, ${qqFiles.length} files`);
+          }
+
+          // ── 2. 提取 markdown 图片和裸图片 URL ──
+          const imageUrlsFromText: string[] = [];
+          let textWithoutImages = cleanedText;
+
+          // ![alt](url)
           const mdImageRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
           let mdMatch: RegExpExecArray | null;
-          while ((mdMatch = mdImageRegex.exec(trimmed)) !== null) {
+          while ((mdMatch = mdImageRegex.exec(cleanedText)) !== null) {
             const url = mdMatch[1];
             if (/^https?:\/\//i.test(url)) imageUrlsFromText.push(url);
           }
           textWithoutImages = textWithoutImages.replace(mdImageRegex, "").trim();
 
-          // 提取裸图片 URL（以常见图片扩展名结尾）
+          // 裸图片 URL
           const bareImageUrlRegex = /(?:^|\s)(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp|bmp)(?:\?\S*)?)/gi;
           let bareMatch: RegExpExecArray | null;
           while ((bareMatch = bareImageUrlRegex.exec(textWithoutImages)) !== null) {
@@ -446,22 +482,40 @@ async function dispatchToAI(
             textWithoutImages = textWithoutImages.replace(bareImageUrlRegex, "").trim();
           }
 
-          const allImageUrls = [...(mediaUrl ? [mediaUrl] : []), ...imageUrlsFromText];
+          // ── 3. 合并所有图片来源 ──
+          const allImageUrls = [...(mediaUrl ? [mediaUrl] : []), ...qqImages, ...imageUrlsFromText];
+          const hasMedia = allImageUrls.length > 0 || qqVideos.length > 0 || qqFiles.length > 0;
 
           const usePlain = getRenderMarkdownToPlain(cfg);
           let textPlain = usePlain
-            ? markdownToPlain(allImageUrls.length > 0 ? textWithoutImages : trimmed)
-            : (allImageUrls.length > 0 ? textWithoutImages : trimmed);
+            ? markdownToPlain(hasMedia ? textWithoutImages : cleanedText)
+            : (hasMedia ? textWithoutImages : cleanedText);
           textPlain = collapseDoubleNewlines(textPlain);
 
           try {
+            // 发送文本
             if (textPlain) {
               if (ig && gid) await sendGroupMsg(gid, textPlain, getConfig);
               else if (uid) await sendPrivateMsg(uid, textPlain, getConfig);
             }
+            // 发送图片
             for (const imgUrl of allImageUrls) {
+              api.logger?.info?.(`[napcat] sending image: ${imgUrl.slice(0, 80)}`);
               if (ig && gid) await sendGroupImage(gid, imgUrl, getConfig);
               else if (uid) await sendPrivateImage(uid, imgUrl, getConfig);
+            }
+            // 发送视频
+            for (const vidUrl of qqVideos) {
+              api.logger?.info?.(`[napcat] sending video: ${vidUrl.slice(0, 80)}`);
+              if (ig && gid) await sendGroupVideo(gid, vidUrl, getConfig);
+              else if (uid) await sendPrivateVideo(uid, vidUrl, getConfig);
+            }
+            // 发送文件
+            for (const filePath of qqFiles) {
+              const fileName = filePath.split("/").pop() || "file";
+              api.logger?.info?.(`[napcat] sending file: ${filePath.slice(0, 80)}`);
+              if (ig && gid) await uploadGroupFile(gid, filePath, fileName, getConfig);
+              else if (uid) await uploadPrivateFile(uid, filePath, fileName, getConfig);
             }
           } catch (e: any) {
             api.logger?.error?.(`[napcat] deliver failed: ${e?.message}`);
