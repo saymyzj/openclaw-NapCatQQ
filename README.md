@@ -4,6 +4,7 @@ NapCat (OneBot v11) channel plugin for OpenClaw.
 
 - GitHub: <https://github.com/saymyzj/openclaw-NapCatQQ>
 - Chinese README: [README.zh-CN.md](./README.zh-CN.md)
+- Contributing: [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 This project connects QQ private chats and group chats to OpenClaw, supports `@`-mention replies, buffered group monitoring with planner pre-check, native QQ media delivery, and a conservative security model suitable for public or semi-public chat surfaces.
 
@@ -360,6 +361,8 @@ npm install
 npm run build
 npm run dev
 ```
+
+CI is configured via GitHub Actions in [ci.yml](./.github/workflows/ci.yml).
 
 ## Project Structure
 

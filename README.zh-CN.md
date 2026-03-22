@@ -4,6 +4,7 @@ NapCat（OneBot v11）的 OpenClaw QQ 频道插件。
 
 - GitHub：<https://github.com/saymyzj/openclaw-NapCatQQ>
 - English README: [README.md](./README.md)
+- 贡献说明：[CONTRIBUTING.md](./CONTRIBUTING.md)
 
 这个插件用于把 QQ 私聊和群聊接入 OpenClaw，支持 `@` 机器人即时回复、白名单群缓冲巡检、独立 planner 预判、QQ 原生图片/视频/文件发送，以及适合公开群聊场景的保守安全策略。
 
@@ -357,6 +358,8 @@ npm install
 npm run build
 npm run dev
 ```
+
+GitHub Actions 自动构建配置位于 [ci.yml](./.github/workflows/ci.yml)。
 
 ## 目录结构
 
