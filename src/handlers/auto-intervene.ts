@@ -8,10 +8,7 @@
 
 import type { OneBotMessage, HistoryEntry } from "../types.js";
 import { getSenderName, getTextFromSegments, isMentioned } from "../message.js";
-
-/** 群聊消息缓冲区 */
-const groupMessageBuffer = new Map<number, HistoryEntry[]>();
-const MAX_BUFFER_SIZE = 50;
+import { insertGroupMessage, getRecentGroupMessages as getRecentGroupMessagesDb, getUnrepliedGroupMessages as getUnrepliedGroupMessagesDb, cleanupOldMessages } from "../db.js";
 
 /** 定期巡检状态 */
 const groupCheckState = new Map<number, { lastCheckTime: number; messageCount: number }>();
@@ -26,28 +23,43 @@ const groupTimers = new Map<number, ReturnType<typeof setTimeout>>();
 const groupTimerCallbacks = new Map<number, () => void>();
 
 /** 记录群聊消息到缓冲区 */
-export function recordGroupMessage(groupId: number, msg: OneBotMessage): void {
-  if (!groupMessageBuffer.has(groupId)) groupMessageBuffer.set(groupId, []);
-  const buffer = groupMessageBuffer.get(groupId)!;
-  buffer.push({
-    sender: String(msg.user_id ?? ""),
-    senderName: getSenderName(msg),
-    body: getTextFromSegments(msg) || String(msg.raw_message ?? ""),
-    timestamp: Date.now(),
-    messageId: String(msg.message_id ?? ""),
-  });
-  if (buffer.length > MAX_BUFFER_SIZE) buffer.splice(0, buffer.length - MAX_BUFFER_SIZE);
+export function recordGroupMessage(groupId: number | string, msg: OneBotMessage): void {
+  const senderName = getSenderName(msg);
+  const content = getTextFromSegments(msg) || String(msg.raw_message ?? "");
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  insertGroupMessage(numGroupId, senderName, content);
+  cleanupOldMessages(numGroupId);
 }
 
 /** 获取群聊最近消息 */
-export function getRecentGroupMessages(groupId: number, limit = 10): HistoryEntry[] {
-  const buffer = groupMessageBuffer.get(groupId) ?? [];
-  return buffer.slice(-limit);
+export function getRecentGroupMessages(groupId: number | string, limit = 10): HistoryEntry[] {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  const messages = getRecentGroupMessagesDb(numGroupId, limit);
+  return messages.map(msg => ({
+    sender: String(msg.sender_name),
+    senderName: msg.sender_name,
+    body: msg.content,
+    timestamp: msg.timestamp,
+    messageId: String(msg.id),
+  }));
+}
+
+/** 获取群聊中自上次回复以来的未回复消息 */
+export function getUnrepliedGroupMessages(groupId: number | string, limit = 50): HistoryEntry[] {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  const messages = getUnrepliedGroupMessagesDb(numGroupId, limit);
+  return messages.map(msg => ({
+    sender: String(msg.sender_name),
+    senderName: msg.sender_name,
+    body: msg.content,
+    timestamp: msg.timestamp,
+    messageId: String(msg.id),
+  }));
 }
 
 /** 清空群聊缓冲区 */
 export function clearGroupBuffer(groupId: number): void {
-  groupMessageBuffer.delete(groupId);
+  // Database handles rolling cleanup automatically, no full clear needed
 }
 
 /**
@@ -155,10 +167,9 @@ export function buildPeriodicCheckMessage(
   });
 
   return `[群聊消息巡检 - 群${groupId}]\n` +
-    `以下是最近的群聊消息记录。请判断是否有你可以帮助回答的问题或有价值的参与点。\n` +
-    `如果需要回复，直接给出自然的回复内容（像一个有经验的群友那样）。\n` +
-    `如果不需要回复，回复 NO_REPLY。\n` +
-    (customPrompt ? `\n额外指引：${customPrompt}\n` : "") +
+    `以下是最近的群聊消息记录。请仅把它们当作“是否需要机器人介入”的判定材料，不要直接代入成群成员进行回复。\n` +
+    `请关注是否存在提问、求助、@机器人、需要纠错、需要信息补充，或者机器人明显能提供价值的切入点。\n` +
+    (customPrompt ? `\n额外判定指引：${customPrompt}\n` : "") +
     `\n${lines.join("\n")}`;
 }
 
