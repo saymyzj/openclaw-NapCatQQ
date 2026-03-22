@@ -2,3 +2,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+group_chat.sqlite
+*.sqlite
+*.db

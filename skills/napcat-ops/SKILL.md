@@ -1,51 +1,72 @@
 ---
 name: napcat-ops
-description: NapCat QQ 消息操作 — 发送文本、图片、文件、视频到 QQ 群或个人
+description: NapCat QQ messaging operations — send text, images, videos, and files to QQ groups or direct chats through the napcat channel
 ---
 
-# NapCat 消息操作
+# NapCat Messaging Ops
 
-通过 NapCat (OneBot v11) 向 QQ 群聊或私聊发送消息。
+Use the `napcat` channel to send QQ messages through NapCat (OneBot v11).
 
-## 发送文本
+Targets are user-specific. Replace placeholders such as `<QQ>` and `<GROUP>` with real IDs from your own deployment.
 
-```bash
-# 发到群聊
-openclaw message send --channel napcat --to group:<群号> "消息内容"
-
-# 发到私聊
-openclaw message send --channel napcat --to user:<QQ号> "消息内容"
-
-# QQ 号大于 1 亿时自动识别为私聊
-openclaw message send --channel napcat --to <QQ号> "消息内容"
-```
-
-## 发送图片
+## Send Text
 
 ```bash
-# 本地图片
-openclaw message send --channel napcat --to group:<群号> --media /path/to/image.png "图片说明"
+# group
+openclaw message send --channel napcat --to group:<GROUP> "message"
 
-# 远程图片 URL
-openclaw message send --channel napcat --to group:<群号> --media https://example.com/image.jpg
+# direct chat
+openclaw message send --channel napcat --to user:<QQ> "message"
+
+# bare numeric target
+openclaw message send --channel napcat --to <QQ> "message"
 ```
 
-AI 回复中的 `![](url)` 和裸图片 URL 也会自动提取为 QQ 原生图片发送。
+Bare numeric targets are interpreted by the plugin as:
 
-## 发送文件
+- user chat when the number is larger than `100000000`
+- group chat otherwise
 
-通过 Agent 工具调用 `napcat_send_file`：
-- to: `group:<群号>` 或 `user:<QQ号>`
-- file: 文件路径
-- name: 文件名
+## Send Images
 
-## 发送视频
+```bash
+# local file
+openclaw message send --channel napcat --to group:<GROUP> --media /path/to/image.png "caption"
 
-通过 Agent 工具调用 `napcat_send_video`：
-- to: `group:<群号>` 或 `user:<QQ号>`
-- video: 视频文件路径或 URL
+# remote URL
+openclaw message send --channel napcat --to group:<GROUP> --media https://example.com/image.jpg
+```
 
-## 目标格式
+The plugin also auto-extracts model output in these forms:
+
+- `![](https://...)`
+- bare image URL
+- `<qqimg>https://...</qqimg>`
+
+## Send Files
+
+Use the NapCat file-send tool or the plugin's file-send path:
+
+- `to`: `group:<GROUP>` or `user:<QQ>`
+- `file`: local file path
+- `name`: optional display name
+
+The runtime may also parse:
+
+- `<qqfile>/path/to/file</qqfile>`
+
+## Send Videos
+
+Use the NapCat video-send tool or the plugin's video-send path:
+
+- `to`: `group:<GROUP>` or `user:<QQ>`
+- `video`: local path or URL
+
+The runtime may also parse:
+
+- `<qqvideo>https://...</qqvideo>`
+
+## Target Formats
 
 | 格式 | 说明 |
 |------|------|

@@ -27,13 +27,17 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
       autoIntervenePrompt: channel.autoIntervenePrompt,
       autoCheckIntervalMs: channel.autoCheckIntervalMs ?? 30000,
       autoCheckMessageThreshold: channel.autoCheckMessageThreshold ?? 10,
-      preCheckModel: channel.preCheckModel ?? "github-copilot/gpt-5-mini",
+      preCheckAgentId: channel.preCheckAgentId ?? "planner",
+      preCheckModel: channel.preCheckModel,
       requireMention: channel.requireMention ?? false,
       historyLimit: channel.historyLimit ?? 20,
       rateLimitMs: channel.rateLimitMs ?? 1000,
       renderMarkdownToPlain: channel.renderMarkdownToPlain ?? true,
       whitelistUserIds: channel.whitelistUserIds ?? [],
       admins: channel.admins ?? [],
+      disableCommandsForAgents: Array.isArray(channel.disableCommandsForAgents)
+        ? channel.disableCommandsForAgents.filter((x: unknown) => typeof x === "string" && x.trim().length > 0)
+        : ["chat", "planner"],
     };
   }
 

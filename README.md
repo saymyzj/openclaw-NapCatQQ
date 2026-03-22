@@ -1,281 +1,399 @@
-# OpenClaw NapCat Plugin
+# OpenClaw NapCat QQ Plugin
 
-NapCat (OneBot v11) 频道插件，将 QQ 群聊接入 OpenClaw AI 助手。
+NapCat (OneBot v11) channel plugin for OpenClaw.
 
-核心能力：**任何群 @机器人 即时回复 + 白名单群定期巡检自动参与**。AI 会自动识别回复中的图片 URL 并以 QQ 原生图片发送，Markdown 标记也会自动转为纯文本。
+- GitHub: <https://github.com/saymyzj/openclaw-NapCatQQ>
+- Chinese README: [README.zh-CN.md](./README.zh-CN.md)
 
-## 功能一览
+This project connects QQ private chats and group chats to OpenClaw, supports `@`-mention replies, buffered group monitoring with planner pre-check, native QQ media delivery, and a conservative security model suitable for public or semi-public chat surfaces.
 
-| 功能 | 说明 |
-|------|------|
-| @即时回复 | 任何群聊中 @机器人，立即回复（附最近 10 条上下文） |
-| 白名单群巡检 | `monitorGroups` 中的群每 30s 或每 10 条消息自动收集，发给 AI 判断是否参与 |
-| 私聊 | 直接对话 AI，可通过 `whitelistUserIds` 限制可用用户 |
-| 多媒体发送 | 文本、图片、视频、文件，群聊与私聊均支持 |
-| 图片自动提取 | AI 回复中的 `![](url)` 和裸图片 URL 自动提取为 QQ 原生图片发送 |
-| Markdown 转纯文本 | 自动去除 AI 回复中的标题、加粗、列表等标记，适配 QQ 显示 |
-| 断线重连 | WebSocket 断开后指数退避自动重连（1s → 2s → 5s → 10s → 30s → 60s） |
-| 思考表情 | 收到 @消息 后添加"思考中"表情，回复完成后自动取消 |
-| 详细日志 | 记录每条收发消息的完整内容和消息段，方便排查 |
+This repository is intended to be published as an MIT-licensed OpenClaw extension. The plugin integrates with OpenClaw's plugin/runtime interfaces, but your actual OpenClaw setup may differ. In particular, values such as agent IDs, workspace paths, model IDs, auth profiles, and session policy are user-specific and must be adjusted locally.
 
-## 前置条件
+## Features
 
-- [OpenClaw](https://github.com/openclaw/openclaw) 2026.1.0+
-- [NapCat](https://github.com/NapNeko/NapCatQQ) 已部署并完成 QQ 登录
-- NapCat 已配置 OneBot v11 **正向 WebSocket**
-- Node.js 22+
+- Private chat support with optional QQ user allowlist
+- Instant reply when the bot is `@`-mentioned in any group
+- Monitored-group buffering and periodic AI intervention checks
+- Dedicated planner pre-check flow via OpenClaw `/v1/chat/completions`
+- Native QQ delivery for text, images, videos, and files
+- Automatic extraction of `![](url)`, bare image URLs, and `<qqimg>/<qqvideo>/<qqfile>` tags from model replies
+- Markdown-to-plain-text conversion for QQ-friendly rendering
+- Buffered context stitching for monitored group replies
+- Route-aware agent selection through OpenClaw bindings
+- Optional background memory summarization that writes Markdown notes into `workspace-chat/memory`
+- Command blocking for selected agents on QQ surfaces, to prevent `/status`, `/model`, `/reset`, `!bash`, etc. from being used from chat
 
-## 安装
+## Compatibility
+
+- OpenClaw: recent local gateway builds with plugin/channel runtime support
+- NapCatQQ: OneBot v11 forward WebSocket mode
+- Node.js: `>=22`
+
+Because OpenClaw evolves quickly, you should verify any runtime-facing behavior against your installed OpenClaw version, especially:
+
+- plugin SDK signatures
+- routing/session behavior
+- tool policy names
+- command parsing behavior
+- `/v1/chat/completions` gateway semantics
+
+## Install
 
 ```bash
-# 克隆到 OpenClaw 扩展目录
-git clone <本仓库地址> ~/.openclaw/extensions/napcat-qq
+git clone https://github.com/saymyzj/openclaw-NapCatQQ ~/.openclaw/extensions/napcat-qq
 cd ~/.openclaw/extensions/napcat-qq
 npm install
 npm run build
 ```
 
-安装完成后重启 OpenClaw Gateway 即可加载插件。
+Then enable the plugin from your OpenClaw config and restart the gateway.
 
-## 配置
+## What Is User-Specific
 
-在 OpenClaw 配置文件（`~/.openclaw/config.json` 或 `openclaw.json`）中添加：
+Do not copy these values blindly from examples in this repository:
 
-```json5
+- `agents.list[].id`
+- `agents.list[].workspace`
+- `agents.list[].agentDir`
+- `agents.list[].model`
+- `auth.profiles.*`
+- `bindings[*].agentId`
+- `bindings[*].match.peer.id`
+- `channels.napcat.preCheckAgentId`
+- `channels.napcat.disableCommandsForAgents`
+- gateway token, WebSocket token, QQ numbers, group numbers
+
+Examples in this README use placeholders such as `chat`, `main`, and `planner`, but your own OpenClaw instance may use different names entirely.
+
+## Recommended OpenClaw Layout
+
+This plugin works best when you separate responsibilities across agents:
+
+- `main`: trusted direct-chat or high-privilege workspace
+- `chat`: low-risk QQ-facing conversational workspace
+- `planner`: ultra-minimal decision agent used only for pre-checking whether the bot should speak
+
+A recommended security posture is:
+
+- `planner`: no tools, no chat commands, tiny workspace, no memory/persona baggage
+- `chat`: read/search-only tools, no write/edit/exec, no chat commands
+- `main`: reserved for trusted/private routes only
+
+## Example OpenClaw Config
+
+This is an example, not a drop-in file.
+
+```jsonc
 {
-  channels: {
-    napcat: {
-      // ─── 连接 ───
-      host: "127.0.0.1",                // NapCat WebSocket 地址
-      port: 3001,                       // NapCat 正向 WebSocket 端口
-      accessToken: "",                  // access token（如有）
-      path: "/",                        // WebSocket 路径
-
-      // ─── 群聊监控 ───
-      monitorGroups: [123456, 789012],  // 白名单群号，这些群会定期巡检
-                                        // 空数组 = 不主动监控，仅响应 @
-      autoIntervene: true,              // 是否启用白名单群的定期巡检
-      autoCheckIntervalMs: 30000,       // 巡检间隔（毫秒），默认 30 秒
-      autoCheckMessageThreshold: 10,    // 消息累积阈值，达到即触发巡检
-      autoIntervenePrompt: "",          // 巡检时附加给 AI 的额外指引（可选）
-
-      // ─── 权限 ───
-      whitelistUserIds: [],             // 私聊白名单 QQ 号，空 = 所有人可私聊
-      admins: [],                       // 管理员 QQ 号
-
-      // ─── 行为 ───
-      historyLimit: 20,                 // 会话历史保留条数
-      rateLimitMs: 1000,                // 发送间隔（毫秒）
-      renderMarkdownToPlain: true       // AI 回复转纯文本后发送
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "workspace": "/path/to/workspace",
+        "agentDir": "/path/to/agents/main/agent",
+        "model": "openai-codex/gpt-5.4"
+      },
+      {
+        "id": "chat",
+        "default": true,
+        "workspace": "/path/to/workspace-chat",
+        "agentDir": "/path/to/agents/chat/agent",
+        "model": "openai-codex/gpt-5.4",
+        "tools": {
+          "allow": ["read", "web-search", "web-fetch", "memory-search", "memory-get"],
+          "deny": ["exec", "write", "edit", "apply_patch"]
+        }
+      },
+      {
+        "id": "planner",
+        "workspace": "/path/to/workspace-planner",
+        "agentDir": "/path/to/agents/planner/agent",
+        "model": "openai-codex/gpt-5.4",
+        "tools": {
+          "allow": [],
+          "deny": [
+            "exec",
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "web-search",
+            "web-fetch",
+            "memory-search",
+            "memory-get",
+            "group:runtime",
+            "group:fs",
+            "group:ui",
+            "group:messaging",
+            "gateway",
+            "nodes",
+            "cron",
+            "browser"
+          ]
+        }
+      }
+    ]
+  },
+  "bindings": [
+    {
+      "agentId": "main",
+      "match": {
+        "channel": "napcat",
+        "peer": {
+          "kind": "direct",
+          "id": "user:1234567890"
+        }
+      }
+    }
+  ],
+  "channels": {
+    "napcat": {
+      "host": "127.0.0.1",
+      "port": 3001,
+      "accessToken": "<napcat_access_token>",
+      "path": "/",
+      "monitorGroups": [123456789],
+      "autoIntervene": true,
+      "autoCheckIntervalMs": 30000,
+      "autoCheckMessageThreshold": 10,
+      "preCheckAgentId": "planner",
+      "disableCommandsForAgents": ["chat", "planner"],
+      "whitelistUserIds": ["1234567890"],
+      "admins": ["1234567890"],
+      "historyLimit": 100,
+      "rateLimitMs": 1000,
+      "renderMarkdownToPlain": true
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": ["~/.openclaw/extensions/napcat-qq"]
+    },
+    "entries": {
+      "openclaw-napcat": {
+        "enabled": true
+      }
     }
   }
 }
 ```
 
-### 配置项速查
+## NapCat Config
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `host` | string | `127.0.0.1` | NapCat WebSocket 主机 |
-| `port` | number | `3001` | NapCat WebSocket 端口 |
-| `accessToken` | string | — | NapCat access token |
-| `path` | string | `/` | WebSocket 路径 |
-| `monitorGroups` | number[] | `[]` | 白名单群号列表，空 = 不主动监控 |
-| `autoIntervene` | boolean | `true` | 是否启用白名单群定期巡检 |
-| `autoCheckIntervalMs` | number | `30000` | 巡检时间间隔（ms） |
-| `autoCheckMessageThreshold` | number | `10` | 消息累积数量阈值 |
-| `autoIntervenePrompt` | string | — | 巡检时附加给 AI 的提示词 |
-| `whitelistUserIds` | number[] | `[]` | 私聊白名单，空 = 所有人 |
-| `admins` | number[] | `[]` | 管理员 QQ 号 |
-| `historyLimit` | number | `20` | 会话历史保留条数 |
-| `rateLimitMs` | number | `1000` | 消息发送间隔（ms） |
-| `renderMarkdownToPlain` | boolean | `true` | Markdown → 纯文本 |
+In NapCat WebUI, configure a forward WebSocket server:
 
-### 环境变量（可选）
+- host: usually `0.0.0.0`
+- port: for example `3001`
+- path: `/`
+- message format: `array` recommended
+- access token: optional, but recommended when the gateway is not fully local
 
-不写配置文件时，可用环境变量设置基础连接：
+Then point `channels.napcat.host/port/path/accessToken` to that endpoint.
+
+## Channel Config
+
+The plugin reads `channels.napcat` from `openclaw.json`.
+
+### Supported Fields
+
+| Field | Type | Default | Notes |
+|---|---|---:|---|
+| `host` | `string` | `127.0.0.1` | NapCat WebSocket host |
+| `port` | `number` | `3001` | NapCat WebSocket port |
+| `accessToken` | `string` | - | NapCat access token |
+| `path` | `string` | `/` | WebSocket path |
+| `monitorGroups` | `number[]` | `[]` | Groups eligible for buffered periodic checks |
+| `autoIntervene` | `boolean` | `true` | Enable monitored-group periodic checks |
+| `autoIntervenePrompt` | `string` | - | Extra planner guidance |
+| `autoCheckIntervalMs` | `number` | `30000` | Timer-based patrol interval |
+| `autoCheckMessageThreshold` | `number` | `10` | Buffered-message threshold |
+| `preCheckAgentId` | `string` | `planner` | OpenClaw agent used for pre-check |
+| `preCheckModel` | `string` | - | Optional override still used by background summarizer; pre-check routing is better controlled via `preCheckAgentId` |
+| `requireMention` | `boolean` | `false` | Mention gating helper for some reply flows |
+| `historyLimit` | `number` | `20` | Pending in-memory history window |
+| `rateLimitMs` | `number` | `1000` | Delay between sends |
+| `renderMarkdownToPlain` | `boolean` | `true` | Convert Markdown before sending |
+| `whitelistUserIds` | `Array<string|number>` | `[]` | Private-chat allowlist |
+| `admins` | `Array<string|number>` | `[]` | Reserved admin IDs for local policy logic |
+| `disableCommandsForAgents` | `string[]` | `["chat","planner"]` | Block `/...` and `!...` for selected routed agents |
+
+### Environment Variables
+
+Only connection basics can be sourced from environment variables:
 
 ```bash
 export NAPCAT_WS_HOST=127.0.0.1
 export NAPCAT_WS_PORT=3001
 export NAPCAT_WS_ACCESS_TOKEN=your_token
+export NAPCAT_WS_PATH=/
 ```
 
-> 环境变量仅支持连接参数，群聊监控等功能需要配置文件。
+Behavioral settings such as monitored groups, planner agent, and command blocking still belong in OpenClaw config.
 
-## NapCat 侧配置
+## Message Flow
 
-在 NapCat WebUI 中配置 OneBot v11 网络：
+### Group Message
 
-1. 打开 `http://<服务器IP>:6099/webui`，使用 token 登录
-2. 进入「网络配置」
-3. 添加一个**正向 WebSocket** 服务：
-   - 监听地址：`0.0.0.0`
-   - 端口：`3001`
-   - 消息格式：`array`（推荐）
-4. 保存并重启 NapCat
+1. Receive a group message
+2. Record it into the local message buffer database
+3. If the bot is mentioned, dispatch immediately
+4. Otherwise, if the group is monitored, buffer and wait for:
+   - message threshold reached, or
+   - timer-triggered periodic check
+5. Send the buffered slice to the planner agent
+6. If planner says `reply`, dispatch buffered context to the routed chat agent
+7. If planner says `silence`, keep quiet and only advance the checkpoint for the processed slice
 
-## Docker 部署示例
+### Private Message
 
-```yaml
-version: "3"
-services:
-  napcat:
-    image: mlikiowa/napcat-docker:latest
-    container_name: napcat
-    ports:
-      - 3000:3000   # HTTP API
-      - 3001:3001   # WebSocket
-      - 6099:6099   # WebUI
-    restart: always
-    network_mode: bridge
+1. Receive a private message
+2. Apply `whitelistUserIds` if configured
+3. Resolve target agent via OpenClaw routing/bindings
+4. Optionally block command-style input for protected agents
+5. Dispatch to OpenClaw
+
+## Routing Notes
+
+This plugin uses OpenClaw route resolution, and private/group traffic may land in different agents depending on:
+
+- default agent
+- `bindings`
+- `session.dmScope`
+- peer match shape such as `user:<qq>` or `group:<groupId>`
+- existing session routing metadata
+
+If you use bindings, verify them against your own OpenClaw version and your chosen peer format.
+
+Example direct-message binding:
+
+```jsonc
+{
+  "bindings": [
+    {
+      "agentId": "main",
+      "match": {
+        "channel": "napcat",
+        "peer": {
+          "kind": "direct",
+          "id": "user:1234567890"
+        }
+      }
+    }
+  ]
+}
 ```
 
-## 消息处理流程
+## Planner Sessions
 
-### 群聊
+The planner pre-check uses OpenClaw gateway `POST /v1/chat/completions`.
 
-```
-收到群消息
-    │
-    ├─ 有人 @机器人？
-    │    └─ 是 → 立即回复（任何群都生效，附最近 10 条上下文）
-    │
-    ├─ 群在 monitorGroups 白名单中？
-    │    ├─ 否 → 静默，不处理
-    │    └─ 是 → 缓存消息，检查是否触发巡检：
-    │              ├─ 距上次巡检 ≥ 30s 且有 ≥ 2 条新消息 → 触发
-    │              ├─ 新消息累积 ≥ 10 条 → 触发
-    │              └─ 未达到 → 继续缓存，等待下次
-    │
-    └─ 巡检触发时：
-         收集最近 15 条消息 → 发给 AI 询问
-         → AI 判断需要回复 → 发送回复到群
-         → AI 判断不需要 → 回复 NO_REPLY → 静默跳过
-```
+Important:
 
-### 私聊
+- this is stateless-per-request, not no-session-at-all
+- OpenClaw may still create one-shot session files for planner requests
+- those session files are expected under the planner agent's session store
 
-```
-收到私聊消息
-    │
-    ├─ whitelistUserIds 非空？
-    │    ├─ 用户在白名单中 → 处理
-    │    └─ 用户不在白名单中 → 忽略
-    │
-    └─ whitelistUserIds 为空 → 所有用户都处理
-```
+If you want low cost and easy cleanup:
 
-### 图片处理
+- keep planner in its own agent
+- give it a minimal workspace
+- clean only the planner session store
 
-AI 回复中的图片会自动提取并以 QQ 原生图片消息发送，支持两种格式：
+## Command Blocking
 
-- Markdown 图片：`![描述](https://example.com/image.png)`
-- 裸图片 URL：`https://example.com/photo.jpg`
+For QQ-facing agents such as `chat` and `planner`, this plugin can block OpenClaw command-style messages before they enter the normal command pipeline.
 
-支持的图片格式：`.png` `.jpg` `.jpeg` `.gif` `.webp` `.bmp`
+Blocked examples:
 
-提取后，URL 从文本中移除，文本部分作为普通消息发送，图片部分作为 OneBot image 消息段发送。
+- `/status`
+- `/model`
+- `/reset`
+- `/new`
+- `!bash ls`
 
-## 发送消息
+This is controlled by `channels.napcat.disableCommandsForAgents`.
 
-### 命令行
+## Media Handling
+
+The plugin supports:
+
+- plain text
+- native QQ image sends
+- native QQ video sends
+- native QQ file uploads
+
+Model replies can include:
+
+- Markdown images: `![](https://example.com/a.png)`
+- bare image URLs
+- `<qqimg>...</qqimg>`
+- `<qqvideo>...</qqvideo>`
+- `<qqfile>...</qqfile>`
+
+The plugin extracts these payloads and sends them through NapCat's QQ-native media APIs.
+
+## Memory Summarization
+
+The plugin includes a background summarizer that periodically:
+
+- reads unsummarized buffered group messages
+- calls the OpenClaw gateway
+- appends a short summary into `workspace-chat/memory/<date>.md`
+
+This write path is performed by the plugin process itself, not by granting the `chat` agent file-write tools.
+
+That means you can keep the `chat` agent read-only while still preserving group-summary notes.
+
+## Security Recommendations
+
+- Do not expose a high-privilege coding agent directly to public group chats
+- Keep `planner` tool-less
+- Keep `chat` read/search-only unless you fully trust the surface
+- Disable QQ-side command access for public-facing agents
+- Avoid reusing your primary workspace for monitored groups
+- Do not publish your real tokens, QQ numbers, absolute home paths, or auth profile names
+
+## Development
 
 ```bash
-# 发送文本到群聊
-openclaw message send --channel napcat --to group:123456 "Hello World"
-
-# 发送文本到私聊
-openclaw message send --channel napcat --to user:654321 "你好"
-
-# 发送图片到群聊
-openclaw message send --channel napcat --to group:123456 --media /path/to/image.png "看这张图"
-
-# QQ 号大于 1 亿时自动识别为私聊
-openclaw message send --channel napcat --to 1234567890 "直接用 QQ 号"
+npm install
+npm run build
+npm run dev
 ```
 
-### 目标格式
+## Project Structure
 
-| 格式 | 说明 |
-|------|------|
-| `group:123456` | 群聊，群号 123456 |
-| `user:654321` | 私聊，QQ 号 654321 |
-| `654321` | 自动判断：> 1 亿为私聊，否则为群聊 |
-
-## 日志
-
-插件会输出详细日志，所有日志以 `[napcat]` 为前缀。
-
-### 日志内容
-
-| 标记 | 含义 |
-|------|------|
-| `◀ recv` | 收到消息 — 包含类型、发送者、群号、消息原文、消息段详情 |
-| `skip group msg` | 群消息被跳过（原因：未@、不在白名单群、未达到巡检条件） |
-| `@mentioned` | 检测到 @机器人，开始处理 |
-| `periodic check triggered` | 白名单群巡检条件满足，开始巡检 |
-| `▶ dispatching to AI` | 消息正在发送给 AI 处理 |
-| `▶ AI reply` | AI 回复内容（含 mediaUrl 信息） |
-| `▶ AI replied NO_REPLY` | AI 判断不需要回复，静默跳过 |
-| `deliver failed` | 消息发送到 QQ 失败 |
-
-### 查看日志
-
-取决于 OpenClaw 的运行方式：
-
-```bash
-# 前台运行 — 日志直接输出到终端
-
-# systemd
-journalctl -u openclaw -f | grep '\[napcat\]'
-
-# PM2
-pm2 logs openclaw | grep '\[napcat\]'
-
-# Docker
-docker logs -f <container> 2>&1 | grep '\[napcat\]'
-```
-
-## 项目结构
-
-```
-napcat-qq/
+```text
+extensions/napcat-qq/
 ├── src/
-│   ├── index.ts                    # 入口，注册插件
-│   ├── channel.ts                  # Channel 插件定义（outbound 接口）
-│   ├── service.ts                  # WebSocket 服务（连接、重连、消息分发）
-│   ├── connection.ts               # OneBot v11 API 封装（发送/接收/媒体处理）
-│   ├── send.ts                     # 高级发送接口（文本/图片/视频/文件）
-│   ├── config.ts                   # 配置解析
-│   ├── types.ts                    # TypeScript 类型定义
-│   ├── message.ts                  # 消息解析工具（文本提取、@检测、图片URL提取）
-│   ├── markdown.ts                 # Markdown → 纯文本转换
-│   ├── sdk.ts                      # OpenClaw Plugin SDK 懒加载
-│   ├── reply-context.ts            # 回复目标上下文管理
+│   ├── index.ts
+│   ├── channel.ts
+│   ├── service.ts
+│   ├── connection.ts
+│   ├── send.ts
+│   ├── config.ts
+│   ├── types.ts
+│   ├── message.ts
+│   ├── markdown.ts
+│   ├── precheck.ts
+│   ├── memory-job.ts
+│   ├── sdk.ts
+│   ├── reply-context.ts
 │   └── handlers/
-│       ├── process-inbound.ts      # 入站消息处理（@回复、定期巡检、私聊分发）
-│       └── auto-intervene.ts       # 群聊巡检引擎（消息缓冲、周期判断、并发锁）
+│       ├── process-inbound.ts
+│       └── auto-intervene.ts
 ├── skills/
 │   └── napcat-ops/
-│       └── SKILL.md                # 消息操作 Skill 说明
-├── openclaw.plugin.json            # 插件清单与配置 Schema
+│       └── SKILL.md
+├── openclaw.plugin.json
 ├── package.json
-└── tsconfig.json
+└── README.md
 ```
 
-## 开发
+## MIT License
 
-```bash
-# 监听模式编译
-npm run dev
+This project is released under the MIT License. See [LICENSE](./LICENSE).
 
-# 一次性编译
-npm run build
-```
+## OpenClaw Attribution
 
-修改代码后重启 OpenClaw Gateway 即可生效。
-
-## 许可
-
-MIT
+This plugin depends on OpenClaw runtime APIs and is designed for OpenClaw deployments. OpenClaw itself is a separate upstream project with its own release cycle, documentation, and compatibility expectations.

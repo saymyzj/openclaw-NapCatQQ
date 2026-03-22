@@ -17,10 +17,12 @@ import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageC
 import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg } from "../connection.js";
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId } from "../reply-context.js";
+import { updateGroupCheckpoint } from "../db.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
 import {
   recordGroupMessage,
   getRecentGroupMessages,
+  getUnrepliedGroupMessages,
   isMonitoredGroup,
   shouldPerformPeriodicCheck,
   lockPeriodicCheck,
@@ -71,7 +73,8 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   // 群聊处理
   // ═══════════════════════════════════════════
   if (isGroup) {
-    const groupId = msg.group_id!;
+    const groupIdStr = String(msg.group_id);
+    const groupId = parseInt(groupIdStr, 10);
     recordGroupMessage(groupId, msg);
 
     const mentioned = isMentioned(msg, selfId);
@@ -159,18 +162,28 @@ async function dispatchGroupMention(
     return;
   }
 
-  const groupId = msg.group_id!;
+  const groupId = parseInt(String(msg.group_id), 10);
   const senderName = getSenderName(msg);
 
-  // 附加群聊上下文
-  const recentMessages = getRecentGroupMessages(groupId, 10);
+  // 附加群聊上下文：获取自上次回复以来的所有消息
+  const recentMessages = getUnrepliedGroupMessages(groupId, 50);
+
+  // 按照你的要求：将未回复的消息拼接，但如果只有一条就直接使用即可
   let enrichedText = messageText;
   if (recentMessages.length > 1) {
     const contextLines = recentMessages
-      .slice(0, -1)
       .map((e) => `[${e.senderName}]: ${e.body}`)
       .join("\n");
-    enrichedText = `[群聊上下文]\n${contextLines}\n\n[当前消息]\n${senderName}: ${messageText}`;
+
+    const promptBase = config.requireMention
+      ? "你是一个群聊AI助手。用户@了你，请回复他们。"
+      : "你是一个热心的群聊参与者。这是最新的对话记录，请直接给出你的回复（不要解释，不要带自己的名字前缀）：";
+
+    enrichedText = `${promptBase}
+
+<chat_context>
+${contextLines}
+</chat_context>`;
   }
 
   await dispatchToAI(api, {
@@ -195,12 +208,19 @@ async function dispatchPeriodicCheck(
   config: any,
 ): Promise<void> {
   lockPeriodicCheck(groupId);
+  let lastMsg: any = null;
+  let processedUntilTs = 0;
+
   try {
-    const recentMessages = getRecentGroupMessages(groupId, 15);
-    if (recentMessages.length < 2) {
-      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: not enough messages, skipping`);
+    // 1. 获取自上次回复以来的所有未回复消息
+    const recentMessages = getUnrepliedGroupMessages(groupId, 30);
+    if (!recentMessages || recentMessages.length === 0) {
+      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: no messages`);
       return;
     }
+
+    lastMsg = recentMessages[recentMessages.length - 1];
+    processedUntilTs = Number(lastMsg?.timestamp ?? 0);
 
     const checkMessage = buildPeriodicCheckMessage(
       groupId,
@@ -211,42 +231,54 @@ async function dispatchPeriodicCheck(
     // ── 第一步：用便宜模型预筛选 ──
     const gatewayPort = cfg?.gateway?.port ?? 18789;
     const gatewayToken = cfg?.gateway?.auth?.token ?? "";
-    const preCheckModel = napCatCfg.preCheckModel ?? "github-copilot/gpt-5-mini";
+    const preCheckAgentId = napCatCfg.preCheckAgentId ?? "planner";
 
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: pre-screening with ${preCheckModel} (${recentMessages.length} msgs)`);
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: pre-screening via agent ${preCheckAgentId} (${recentMessages.length} msgs)`);
 
     const preResult = await preCheckWithCheapModel(checkMessage, {
       gatewayPort,
       gatewayToken,
-      model: preCheckModel,
+      agentId: preCheckAgentId,
+      model: napCatCfg.preCheckModel,
       customPrompt: napCatCfg.autoIntervenePrompt,
     });
 
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: precheck result=${preResult.shouldReply} reason=${preResult.reason}`);
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: precheck result=${JSON.stringify(preResult)}`);
 
-    if (!preResult.shouldReply) {
-      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: cheap model says NO, skipping main model`);
+    if (!preResult || preResult.action !== "reply") {
+      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: planner says NO (${preResult?.think}). Insight: ${preResult?.action}`);
       return;
     }
 
-    // ── 第二步：便宜模型说 YES，调用主模型生成回复 ──
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: cheap model says YES, dispatching to main model`);
+    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: planner says YES, dispatching to main model. Insight: ${preResult.think}`);
 
-    const lastMsg = recentMessages[recentMessages.length - 1];
+    // 直接将所有未回复消息组织为上下文发送
+    const contextLines = recentMessages.map((m) => `[${m.senderName}]: ${m.body}`).join("\n");
+    const enrichedText = `
+<chat_context>
+${contextLines}
+</chat_context>
+
+请根据上述群聊最新动态，给出一个自然的回复，**不要带有任何前缀和引号**。
+如果你觉得此刻不合适回复，请只回复 NO_REPLY。
+`;
 
     await dispatchToAI(api, {
       runtime, cfg, napCatCfg, config,
-      userId: Number(lastMsg.sender) || 0,
+      userId: 0, // 巡检事件没有特定发件人，用 0 代表系统触发
       groupId,
       isGroup: true,
       senderName: "群聊巡检",
-      messageText: checkMessage,
-      rawMessageText: checkMessage,
+      messageText: enrichedText,
+      rawMessageText: lastMsg.body,
       messageId: undefined,
       isPeriodicCheck: true,
     });
   } finally {
+    // 如果是群聊且发送过消息（未抛出异常或中途跳出），更新回复检查点。
+    // 在整个过程完整结束后记录，确保真正的答复才会更新检查点。
     markPeriodicCheckDone(groupId);
+    if (processedUntilTs > 0) updateGroupCheckpoint(groupId, processedUntilTs);
   }
 }
 
@@ -299,17 +331,18 @@ async function dispatchToAI(
   } = opts;
   const rawMessageText = opts.rawMessageText ?? messageText;
   const { buildPendingHistoryContextFromMap, recordPendingHistoryEntry, clearHistoryEntriesIfEnabled } = getSdk();
-
-  const sessionId = isGroup
-    ? `napcat:group:${groupId}`.toLowerCase()
-    : `napcat:${userId}`.toLowerCase();
-
-  const route = runtime.channel.routing?.resolveAgentRoute?.({
+  const accountId = config.accountId ?? "default";
+  const replyTarget = isGroup ? `napcat:group:${groupId}` : `napcat:${userId}`;
+  const route = resolveNapCatRoute({
     cfg,
-    sessionKey: sessionId,
-    channel: "napcat",
-    accountId: config.accountId ?? "default",
-  }) ?? { agentId: "main" };
+    runtime,
+    accountId,
+    isGroup,
+    userId,
+    groupId,
+  }) ?? { agentId: "main", accountId, sessionKey: replyTarget.toLowerCase(), matchedBy: "default" };
+  const sessionId = String(route.sessionKey ?? replyTarget).toLowerCase();
+  const commandsDisabledForAgent = (napCatCfg.disableCommandsForAgents ?? ["chat", "planner"]).includes(route.agentId);
 
   const storePath = runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
     agentId: route.agentId,
@@ -364,14 +397,17 @@ async function dispatchToAI(
   }
 
   // ─── 构建分发上下文 ───
-  const replyTarget = isGroup ? `napcat:group:${groupId}` : `napcat:${userId}`;
+  const effectiveAgentBody = isPeriodicCheck ? messageText : rawMessageText;
   const ctxPayload = {
     Body: body,
-    RawBody: rawMessageText,
+    BodyForAgent: effectiveAgentBody,
+    BodyForCommands: effectiveAgentBody,
+    RawBody: effectiveAgentBody,
+    CommandBody: effectiveAgentBody,
     From: replyTarget,
     To: replyTarget,
     SessionKey: sessionId,
-    AccountId: config.accountId ?? "default",
+    AccountId: route.accountId ?? accountId,
     ChatType: chatType,
     ConversationLabel: replyTarget,
     SenderName: fromLabel,
@@ -382,11 +418,11 @@ async function dispatchToAI(
     Timestamp: Date.now(),
     OriginatingChannel: "napcat",
     OriginatingTo: replyTarget,
-    CommandAuthorized: true,
+    CommandAuthorized: commandsDisabledForAgent ? false : true,
     DeliveryContext: {
       channel: "napcat",
       to: replyTarget,
-      accountId: config.accountId ?? "default",
+      accountId: route.accountId ?? accountId,
     },
     _napcat: { userId, groupId, isGroup, senderName },
   };
@@ -396,13 +432,29 @@ async function dispatchToAI(
       storePath,
       sessionKey: sessionId,
       ctx: ctxPayload,
-      updateLastRoute: { sessionKey: sessionId, channel: "napcat", to: isGroup ? `group:${groupId}` : String(userId), accountId: config.accountId ?? "default" },
+      updateLastRoute: {
+        sessionKey: sessionId,
+        channel: "napcat",
+        to: replyTarget,
+        accountId: route.accountId ?? accountId,
+      },
       onRecordError: (err: any) => api.logger?.warn?.(`[napcat] recordInboundSession: ${err}`),
     });
   }
 
   if (runtime.channel.activity?.record) {
-    runtime.channel.activity.record({ channel: "napcat", accountId: config.accountId ?? "default", direction: "inbound" });
+    runtime.channel.activity.record({ channel: "napcat", accountId: route.accountId ?? accountId, direction: "inbound" });
+  }
+
+  if (!isPeriodicCheck && commandsDisabledForAgent && isOpenClawCommandInput(rawMessageText)) {
+    api.logger?.info?.(`[napcat] blocking command-style input for agent ${route.agentId}: "${rawMessageText.slice(0, 100)}"`);
+    const denyText = "当前 QQ 会话已禁用 OpenClaw 命令（如 /status、/model、/reset、!bash）。";
+    if (isGroup && groupId != null) {
+      await sendGroupMsg(groupId, denyText);
+    } else {
+      await sendPrivateMsg(userId, denyText);
+    }
+    return;
   }
 
   // ─── 思考表情（巡检时不加） ───
@@ -422,7 +474,9 @@ async function dispatchToAI(
   };
 
   // ─── 分发消息给 AI 并处理回复 ───
-  api.logger?.info?.(`[napcat] ▶ dispatching to AI for session ${sessionId}${isPeriodicCheck ? " (periodic check)" : ""}, text="${messageText.slice(0, 100)}"`);
+  api.logger?.info?.(
+    `[napcat] ▶ dispatching to AI for session ${sessionId}${isPeriodicCheck ? " (periodic check)" : ""}, agent=${route.agentId} matchedBy=${route.matchedBy ?? "unknown"}, text="${messageText.slice(0, 100)}"`,
+  );
 
   setActiveReplyTarget(replyTarget);
   const replySessionId = `napcat-reply-${Date.now()}-${sessionId}`;
@@ -577,7 +631,55 @@ async function dispatchToAI(
       } catch { }
     }
   } finally {
+    // 如果是群聊且发送过消息（未抛出异常或中途跳出），更新回复检查点。
+    // 在整个过程完整结束后记录，确保真正的答复才会更新检查点。
+    const { groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
+    if (ig && gid) {
+       updateGroupCheckpoint(gid);
+    }
     setActiveReplySessionId(null);
     clearActiveReplyTarget();
   }
+}
+
+function resolveNapCatRoute(params: {
+  cfg: any;
+  runtime: any;
+  accountId: string;
+  isGroup: boolean;
+  userId: number;
+  groupId: number | undefined;
+}): any {
+  const { cfg, runtime, accountId, isGroup, userId, groupId } = params;
+  const resolver = runtime.channel.routing?.resolveAgentRoute;
+  if (!resolver) return null;
+
+  const peerCandidates = isGroup
+    ? [
+        { kind: "group", id: `group:${String(groupId)}` },
+        { kind: "group", id: String(groupId) },
+      ]
+    : [
+        { kind: "direct", id: `user:${String(userId)}` },
+        { kind: "direct", id: String(userId) },
+      ];
+
+  let fallbackRoute: any = null;
+  for (const peer of peerCandidates) {
+    const route = resolver({
+      cfg,
+      channel: "napcat",
+      accountId,
+      peer,
+    });
+    if (!fallbackRoute) fallbackRoute = route;
+    if (route?.matchedBy && route.matchedBy !== "default") return route;
+  }
+  return fallbackRoute;
+}
+
+function isOpenClawCommandInput(text: string | undefined): boolean {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return false;
+  return trimmed.startsWith("/") || trimmed.startsWith("!");
 }

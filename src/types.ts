@@ -44,6 +44,7 @@ export interface NapCatConfig {
   autoIntervenePrompt?: string;
   autoCheckIntervalMs?: number;
   autoCheckMessageThreshold?: number;
+  preCheckAgentId?: string;
   preCheckModel?: string;
   requireMention?: boolean;
   historyLimit?: number;
@@ -51,6 +52,7 @@ export interface NapCatConfig {
   renderMarkdownToPlain?: boolean;
   whitelistUserIds?: number[];
   admins?: number[];
+  disableCommandsForAgents?: string[];
 }
 
 /** 发送结果 */

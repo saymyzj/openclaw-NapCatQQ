@@ -47,10 +47,14 @@
         "default": 10,
         "description": "白名单群消息累积数量阈值，达到即触发巡检，默认 10 条"
       },
+      "preCheckAgentId": {
+        "type": "string",
+        "default": "planner",
+        "description": "定期巡检预筛选使用的 OpenClaw agent ID。该 agent 建议使用最小 workspace、无工具、无记忆。"
+      },
       "preCheckModel": {
         "type": "string",
-        "default": "github-copilot/gpt-5-mini",
-        "description": "定期巡检预筛选模型，先用便宜模型判断是否需要回复，再调用主模型生成内容"
+        "description": "可选模型字段。当前更推荐通过 preCheckAgentId 控制预筛选 agent，再由该 agent 自己决定实际模型。"
       },
       "historyLimit": {
         "type": "number",
@@ -76,6 +80,11 @@
         "type": "array",
         "items": { "type": "number" },
         "description": "管理员 QQ 号列表"
+      },
+      "disableCommandsForAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "对这些 agent 路由禁用 QQ 侧命令风格输入（如 /status、/model、/reset、!bash）。默认建议至少包含 chat 和 planner。"
       }
     }
   },
@@ -87,6 +96,7 @@
     "autoIntervene": { "label": "启用定期巡检" },
     "autoCheckIntervalMs": { "label": "巡检间隔（毫秒）", "placeholder": "30000" },
     "autoCheckMessageThreshold": { "label": "巡检消息阈值", "placeholder": "10" },
+    "preCheckAgentId": { "label": "预筛选 Agent ID", "placeholder": "planner" },
     "whitelistUserIds": { "label": "私聊白名单 QQ 号" }
   }
 }
