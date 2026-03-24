@@ -11,30 +11,53 @@
  *   - 否则处理所有私聊
  */
 
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
 import type { OneBotMessage } from "../types.js";
 import { getNapCatConfig, getRenderMarkdownToPlain, getWhitelistUserIds } from "../config.js";
-import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageContent, isMentioned, getSenderName } from "../message.js";
-import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg } from "../connection.js";
+import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageContent, getImageUrls, getImageUrlsFromMessageContent, isMentioned, getSenderName } from "../message.js";
+import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg, resolveMediaToBase64Cached, rememberMessageMedia, getCachedMessageMedia } from "../connection.js";
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId } from "../reply-context.js";
-import { updateGroupCheckpoint } from "../db.js";
+import {
+  getGroupEngagementState,
+  markGroupDirected,
+  markGroupReplyObserved,
+  updateGroupProcessedCheckpoint,
+  updateGroupReplyCheckpoint,
+  updateGroupReplyAnchor,
+  insertReflectionSample,
+  getPendingReflectionSamples,
+  markReflectionSamplesReflected,
+} from "../db.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
+import { normalizePersonaTurn, normalizeVoiceText, type PersonaTurn } from "../persona.js";
+import { registerPendingApprovalSurface } from "../pending-approval.js";
 import {
   recordGroupMessage,
-  getRecentGroupMessages,
+  attachGroupMessageImageSummary,
   getUnrepliedGroupMessages,
+  getMessagesSinceLastReply,
   isMonitoredGroup,
   shouldPerformPeriodicCheck,
   lockPeriodicCheck,
   markPeriodicCheckDone,
-  buildPeriodicCheckMessage,
-  buildMentionContextPrompt,
+  getGroupReplyAnchor,
   scheduleTimerCheck,
+  getGroupActivityVersion,
 } from "./auto-intervene.js";
-import { preCheckWithCheapModel } from "../precheck.js";
+import { answerImagesWithResponses, summarizeImagesWithResponses } from "../responses.js";
 
 const DEFAULT_HISTORY_LIMIT = 20;
 export const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
+
+type RuntimeAgentRunResult = {
+  finalText: string;
+  status: "completed" | "approval-pending" | "approval-unavailable";
+  approvalMessage: string;
+  queuedFinal: boolean;
+};
 
 export async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void> {
   await loadPluginSdk();
@@ -64,10 +87,25 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   const _segments = msg.message?.map((s: any) => `${s.type}${s.data ? ":" + JSON.stringify(s.data).slice(0, 80) : ""}`).join(", ") ?? "";
   api.logger?.info?.(`[napcat] ◀ recv ${_msgType} from ${msg.user_id}(${_senderName})${_groupId ? ` in group ${_groupId}` : ""}: "${_rawText.slice(0, 100)}" [segments: ${_segments}]`);
 
+  primeInboundImageCache(msg).catch((err) => {
+    api.logger?.warn?.(`[napcat] image prefetch skipped for message ${msg.message_id ?? "unknown"}: ${err?.message}`);
+  });
+
   // 忽略自己发的消息
   if (msg.user_id != null && Number(msg.user_id) === Number(selfId)) return;
 
   const isGroup = msg.message_type === "group";
+
+  if (!isGroup && shouldHandleControlPlaneCommand(msg, napCatCfg)) {
+    await handleControlPlaneCommand(api, {
+      msg,
+      runtime,
+      cfg,
+      config,
+      napCatCfg,
+    });
+    return;
+  }
 
   // ═══════════════════════════════════════════
   // 群聊处理
@@ -75,10 +113,24 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   if (isGroup) {
     const groupIdStr = String(msg.group_id);
     const groupId = parseInt(groupIdStr, 10);
-    recordGroupMessage(groupId, msg);
+    const recordedMessageId = recordGroupMessage(groupId, msg);
+    if (looksDirectedToBot(msg, selfId)) {
+      markGroupDirected(groupId, Number(msg.time ?? 0) > 0 ? Number(msg.time) * 1000 : Date.now());
+    }
 
     const mentioned = isMentioned(msg, selfId);
     const monitored = isMonitoredGroup(groupId, napCatCfg.monitorGroups ?? []);
+
+    maybeSummarizeGroupImagesToHistory(api, {
+      cfg,
+      napCatCfg,
+      msg,
+      groupId,
+      dbMessageId: recordedMessageId,
+      enabled: monitored,
+    }).catch((err) => {
+      api.logger?.warn?.(`[napcat] group image summary skipped for group ${groupId}: ${err?.message}`);
+    });
 
     if (mentioned) {
       // ── @机器人：任何群都立即回复 ──
@@ -123,15 +175,32 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   // 私聊处理
   // ═══════════════════════════════════════════
   const userId = msg.user_id!;
+  const extracted = await extractMessagePayload(msg, napCatCfg.multimodalImageMaxCount ?? 3, api);
+  const imageUrls = extracted.imageUrls;
   const whitelist = getWhitelistUserIds(cfg);
   if (whitelist.length > 0 && !whitelist.includes(Number(userId))) {
     api.logger?.info?.(`[napcat] user ${userId} not in whitelist, skipping private msg`);
     return;
   }
 
-  const messageText = await extractMessageText(msg);
-  if (!messageText?.trim()) {
+  const messageText = extracted.text;
+  if (!messageText?.trim() && imageUrls.length === 0) {
     api.logger?.info?.("[napcat] ignoring empty private message");
+    return;
+  }
+  if (shouldUseMultimodalImages(napCatCfg, imageUrls)) {
+    await dispatchImageAwareTurn(api, {
+      runtime, cfg, napCatCfg, config,
+      userId,
+      groupId: undefined,
+      isGroup: false,
+      senderName: getSenderName(msg),
+      messageText,
+      rawMessageText: messageText,
+      messageId: msg.message_id,
+      imageUrls,
+      replyCheckpointTs: 0,
+    });
     return;
   }
 
@@ -141,6 +210,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     senderName: getSenderName(msg),
     messageText,
     messageId: msg.message_id,
+    replyCheckpointTs: 0,
   });
 }
 
@@ -156,8 +226,10 @@ async function dispatchGroupMention(
   config: any,
   selfId: number,
 ): Promise<void> {
-  const messageText = await extractMessageText(msg);
-  if (!messageText?.trim()) {
+  const extracted = await extractMessagePayload(msg, napCatCfg.multimodalImageMaxCount ?? 3, api);
+  const imageUrls = extracted.imageUrls;
+  const messageText = extracted.text;
+  if (!messageText?.trim() && imageUrls.length === 0) {
     api.logger?.info?.("[napcat] ignoring empty @mention message");
     return;
   }
@@ -165,8 +237,8 @@ async function dispatchGroupMention(
   const groupId = parseInt(String(msg.group_id), 10);
   const senderName = getSenderName(msg);
 
-  // 附加群聊上下文：获取自上次回复以来的所有消息
-  const recentMessages = getUnrepliedGroupMessages(groupId, 50);
+  // 附加群聊上下文：获取自上次真实回复以来的所有消息
+  const recentMessages = getMessagesSinceLastReply(groupId, 50);
 
   // 按照你的要求：将未回复的消息拼接，但如果只有一条就直接使用即可
   let enrichedText = messageText;
@@ -186,6 +258,20 @@ ${contextLines}
 </chat_context>`;
   }
 
+  if (shouldUseMultimodalImages(napCatCfg, imageUrls)) {
+    await dispatchImageAwareTurn(api, {
+      runtime, cfg, napCatCfg, config,
+      userId: msg.user_id!, groupId, isGroup: true,
+      senderName,
+      messageText: enrichedText,
+      rawMessageText: messageText,
+      messageId: msg.message_id,
+      imageUrls,
+      replyCheckpointTs: Number(msg.time ?? 0) > 0 ? Number(msg.time) * 1000 : Date.now(),
+    });
+    return;
+  }
+
   await dispatchToAI(api, {
     runtime, cfg, napCatCfg, config,
     userId: msg.user_id!, groupId, isGroup: true,
@@ -193,6 +279,7 @@ ${contextLines}
     messageText: enrichedText,
     rawMessageText: messageText,
     messageId: msg.message_id,
+    replyCheckpointTs: Number(msg.time ?? 0) > 0 ? Number(msg.time) * 1000 : Date.now(),
   });
 }
 
@@ -210,6 +297,7 @@ async function dispatchPeriodicCheck(
   lockPeriodicCheck(groupId);
   let lastMsg: any = null;
   let processedUntilTs = 0;
+  let activityVersionAtStart = getGroupActivityVersion(groupId);
 
   try {
     // 1. 获取自上次回复以来的所有未回复消息
@@ -221,47 +309,29 @@ async function dispatchPeriodicCheck(
 
     lastMsg = recentMessages[recentMessages.length - 1];
     processedUntilTs = Number(lastMsg?.timestamp ?? 0);
+    activityVersionAtStart = getGroupActivityVersion(groupId);
 
-    const checkMessage = buildPeriodicCheckMessage(
-      groupId,
+    const contextSource = getMessagesSinceLastReply(groupId, Math.max(recentMessages.length, 100));
+    const sectionImageContext = await maybeBuildSectionImageContext(api, {
+      cfg,
+      napCatCfg,
+      contextSource,
       recentMessages,
-      napCatCfg.autoIntervenePrompt,
-    );
-
-    // ── 第一步：用便宜模型预筛选 ──
-    const gatewayPort = cfg?.gateway?.port ?? 18789;
-    const gatewayToken = cfg?.gateway?.auth?.token ?? "";
-    const preCheckAgentId = napCatCfg.preCheckAgentId ?? "planner";
-
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: pre-screening via agent ${preCheckAgentId} (${recentMessages.length} msgs)`);
-
-    const preResult = await preCheckWithCheapModel(checkMessage, {
-      gatewayPort,
-      gatewayToken,
-      agentId: preCheckAgentId,
-      model: napCatCfg.preCheckModel,
-      customPrompt: napCatCfg.autoIntervenePrompt,
     });
-
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: precheck result=${JSON.stringify(preResult)}`);
-
-    if (!preResult || preResult.action !== "reply") {
-      api.logger?.info?.(`[napcat] periodic check for group ${groupId}: planner says NO (${preResult?.think}). Insight: ${preResult?.action}`);
-      return;
-    }
-
-    api.logger?.info?.(`[napcat] periodic check for group ${groupId}: planner says YES, dispatching to main model. Insight: ${preResult.think}`);
-
-    // 直接将所有未回复消息组织为上下文发送
-    const contextLines = recentMessages.map((m) => `[${m.senderName}]: ${m.body}`).join("\n");
+    const contextLines = contextSource.map((m) => `[${m.senderName}]: ${m.body}`).join("\n");
     const enrichedText = `
 <chat_context>
 ${contextLines}
 </chat_context>
+${sectionImageContext ? `\n${sectionImageContext}\n` : ""}
 
 请根据上述群聊最新动态，给出一个自然的回复，**不要带有任何前缀和引号**。
 如果你觉得此刻不合适回复，请只回复 NO_REPLY。
 `;
+
+    api.logger?.info?.(
+      `[napcat] periodic check for group ${groupId}: persona mode active (${recentMessages.length} msgs)`,
+    );
 
     await dispatchToAI(api, {
       runtime, cfg, napCatCfg, config,
@@ -273,12 +343,108 @@ ${contextLines}
       rawMessageText: lastMsg.body,
       messageId: undefined,
       isPeriodicCheck: true,
+      replyCheckpointTs: processedUntilTs,
+      staleGroupActivityVersion: activityVersionAtStart,
     });
   } finally {
-    // 如果是群聊且发送过消息（未抛出异常或中途跳出），更新回复检查点。
-    // 在整个过程完整结束后记录，确保真正的答复才会更新检查点。
+    // 巡检结束后推进“已处理”游标，
+    // 但不在这里更新“真实回复”游标，避免巡检回合在未真正发言时吃掉上下文。
     markPeriodicCheckDone(groupId);
-    if (processedUntilTs > 0) updateGroupCheckpoint(groupId, processedUntilTs);
+    if (processedUntilTs > 0) updateGroupProcessedCheckpoint(groupId, processedUntilTs);
+  }
+}
+
+async function dispatchImageAwareTurn(
+  api: any,
+  opts: {
+    runtime: any;
+    cfg: any;
+    napCatCfg: any;
+    config: any;
+    userId: number;
+    groupId: number | undefined;
+    isGroup: boolean;
+    senderName: string;
+    messageText: string;
+    rawMessageText?: string;
+    messageId: number | undefined;
+    imageUrls: string[];
+    replyCheckpointTs?: number;
+  },
+): Promise<void> {
+  const {
+    runtime, cfg, napCatCfg, config,
+    userId, groupId, isGroup,
+    senderName, messageText,
+    messageId, imageUrls, replyCheckpointTs,
+  } = opts;
+  const rawMessageText = opts.rawMessageText ?? messageText;
+
+  const dispatchMeta = resolveNapCatDispatchMeta({
+    cfg,
+    runtime,
+    config,
+    napCatCfg,
+    userId,
+    groupId,
+    isGroup,
+  });
+
+  if (dispatchMeta.commandsDisabledForAgent && isOpenClawCommandInput(rawMessageText)) {
+    api.logger?.info?.(`[napcat] blocking command-style input for agent ${dispatchMeta.route.agentId}: "${rawMessageText.slice(0, 100)}"`);
+    const denyText = "当前 QQ 会话已禁用 OpenClaw 命令（如 /status、/model、/reset、!bash）。";
+    if (isGroup && groupId != null) await sendGroupMsg(groupId, denyText);
+    else await sendPrivateMsg(userId, denyText);
+    return;
+  }
+
+  const questionAware = looksLikeImageQuestion(rawMessageText);
+  const personaPreferred = shouldUsePersonaReply(napCatCfg, {
+    isGroup,
+    groupId,
+    routeAgentId: dispatchMeta.route.agentId,
+  });
+  const multimodalText = questionAware
+    ? buildVisionQuestionPromptWithContext(rawMessageText, imageUrls.length, personaPreferred && groupId != null ? buildGroupSectionContext(groupId, rawMessageText) : "")
+    : buildVisionSummaryPrompt(imageUrls.length);
+  const summaryAgentId = personaPreferred
+    ? (napCatCfg?.persona?.coreAgentId ?? "persona-core")
+    : dispatchMeta.route.agentId;
+  api.logger?.info?.(
+    `[napcat] ▶ analyzing multimodal input for session ${dispatchMeta.sessionId}, summaryAgent=${summaryAgentId}, replyAgent=${dispatchMeta.route.agentId} matchedBy=${dispatchMeta.route.matchedBy ?? "unknown"}, images=${imageUrls.length}, text="${multimodalText.slice(0, 100)}"`,
+  );
+
+  try {
+    const imageSummary = await (questionAware ? answerImagesWithResponses : summarizeImagesWithResponses)({
+      gatewayPort: cfg?.gateway?.port ?? 18789,
+      gatewayToken: cfg?.gateway?.auth?.token ?? "",
+      agentId: summaryAgentId,
+      inputText: multimodalText,
+      imageUrls,
+    });
+    const enrichedText = [
+      messageText.trim(),
+      "",
+      "<image_context>",
+      imageSummary,
+      "</image_context>",
+    ].filter(Boolean).join("\n");
+
+    await dispatchToAI(api, {
+      runtime, cfg, napCatCfg, config,
+      userId, groupId, isGroup,
+      senderName,
+      messageText: enrichedText,
+      rawMessageText,
+      messageId,
+      replyCheckpointTs,
+    });
+  } catch (err: any) {
+    api.logger?.error?.(`[napcat] multimodal analysis failed: ${err?.message}`);
+    try {
+      if (isGroup && groupId != null) await sendGroupMsg(groupId, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+      else await sendPrivateMsg(userId, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+    } catch { }
   }
 }
 
@@ -303,6 +469,68 @@ async function extractMessageText(msg: OneBotMessage): Promise<string> {
   return getRawText(msg);
 }
 
+async function extractMessagePayload(msg: OneBotMessage, maxImageCount: number, api?: any): Promise<{ text: string; imageUrls: string[] }> {
+  const directImageUrls = getImageUrls(msg);
+  const replyId = getReplyMessageId(msg);
+  if (replyId == null) {
+    return {
+      text: getRawText(msg),
+      imageUrls: clampImageUrls(directImageUrls, maxImageCount),
+    };
+  }
+
+  const userText = getTextFromSegments(msg);
+  try {
+    const cachedQuotedImages = getCachedMessageMedia(replyId);
+    const quoted = await getMsg(replyId);
+    const quotedText = quoted ? getTextFromMessageContent(quoted.message) : "";
+    let quotedImageUrls = cachedQuotedImages;
+    if (quotedImageUrls.length === 0) {
+      const quotedRawImageUrls = Array.from(new Set([
+        ...(quoted ? getImageUrlsFromMessageContent(quoted.message) : []),
+        ...(quoted ? getImageUrlsFromMessageContent((quoted as any)?.raw_message as string | undefined) : []),
+        ...getImageUrlsFromMessageContent(quotedText),
+      ]));
+      api?.logger?.info?.(
+        `[napcat] reply image extraction replyId=${replyId} cache=0 messageType=${Array.isArray(quoted?.message) ? "array" : typeof quoted?.message} rawType=${typeof (quoted as any)?.raw_message} extracted=${quotedRawImageUrls.length}`,
+      );
+      quotedImageUrls = await materializeImageRefs(quotedRawImageUrls);
+      rememberMessageMedia(replyId, quotedImageUrls);
+    } else {
+      api?.logger?.info?.(`[napcat] reply image extraction replyId=${replyId} cacheHit=${quotedImageUrls.length}`);
+    }
+    const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
+    const text = quotedText.trim()
+      ? `[引用 ${String(senderLabel)} 的消息：${quotedText.trim()}]\n${userText}`
+      : userText;
+    return {
+      text,
+      imageUrls: clampImageUrls([...quotedImageUrls, ...directImageUrls], maxImageCount),
+    };
+  } catch {
+    return {
+      text: userText,
+      imageUrls: clampImageUrls(directImageUrls, maxImageCount),
+    };
+  }
+}
+
+async function materializeImageRefs(refs: string[]): Promise<string[]> {
+  const results = await Promise.allSettled(refs.map((ref) => resolveMediaToBase64Cached(ref)));
+  return results
+    .map((result, idx) => result.status === "fulfilled" ? result.value : refs[idx])
+    .filter(Boolean);
+}
+
+async function primeInboundImageCache(msg: OneBotMessage): Promise<void> {
+  const imageRefs = getImageUrls(msg);
+  if (!Array.isArray(imageRefs) || imageRefs.length === 0 || msg.message_id == null) return;
+  const cached = getCachedMessageMedia(msg.message_id);
+  if (cached.length > 0) return;
+  const materialized = await materializeImageRefs(imageRefs);
+  rememberMessageMedia(msg.message_id, materialized);
+}
+
 // ─────────────────────────────────────────────
 // 核心：分发给 AI 并处理回复
 // ─────────────────────────────────────────────
@@ -321,28 +549,322 @@ async function dispatchToAI(
     rawMessageText?: string;
     messageId: number | undefined;
     isPeriodicCheck?: boolean;
+    replyCheckpointTs?: number;
+    staleGroupActivityVersion?: number;
   },
 ): Promise<void> {
   const {
     runtime, cfg, napCatCfg, config,
     userId, groupId, isGroup,
+  } = opts;
+  const {
     senderName, messageText,
-    messageId, isPeriodicCheck,
   } = opts;
   const rawMessageText = opts.rawMessageText ?? messageText;
-  const { buildPendingHistoryContextFromMap, recordPendingHistoryEntry, clearHistoryEntriesIfEnabled } = getSdk();
-  const accountId = config.accountId ?? "default";
-  const replyTarget = isGroup ? `napcat:group:${groupId}` : `napcat:${userId}`;
-  const route = resolveNapCatRoute({
+  const dispatchMeta = resolveNapCatDispatchMeta({
     cfg,
     runtime,
-    accountId,
+    config,
+    napCatCfg,
     isGroup,
     userId,
     groupId,
-  }) ?? { agentId: "main", accountId, sessionKey: replyTarget.toLowerCase(), matchedBy: "default" };
-  const sessionId = String(route.sessionKey ?? replyTarget).toLowerCase();
-  const commandsDisabledForAgent = (napCatCfg.disableCommandsForAgents ?? ["chat", "planner"]).includes(route.agentId);
+  });
+  const { route, commandsDisabledForAgent } = dispatchMeta;
+
+  if (shouldUsePersonaReply(napCatCfg, {
+    isGroup,
+    groupId,
+    routeAgentId: route.agentId,
+  })) {
+    try {
+      await dispatchToAIPersona(api, opts, dispatchMeta);
+      return;
+    } catch (err: any) {
+      api.logger?.error?.(`[napcat] persona dispatch failed: ${err?.message}`);
+      if (!opts.isPeriodicCheck) {
+        try {
+          if (isGroup && groupId != null) await sendGroupMsg(groupId, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+          else await sendPrivateMsg(userId, `处理失败: ${err?.message?.slice(0, 80) || "未知错误"}`);
+        } catch { }
+      }
+      return;
+    }
+  }
+
+  await dispatchToAISingleBrain(api, opts, dispatchMeta);
+}
+
+async function dispatchToAIPersona(
+  api: any,
+  opts: {
+    runtime: any;
+    cfg: any;
+    napCatCfg: any;
+    config: any;
+    userId: number;
+    groupId: number | undefined;
+    isGroup: boolean;
+    senderName: string;
+    messageText: string;
+    rawMessageText?: string;
+    messageId: number | undefined;
+    isPeriodicCheck?: boolean;
+    replyCheckpointTs?: number;
+    staleGroupActivityVersion?: number;
+  },
+  dispatchMeta: {
+    accountId: string;
+    replyTarget: string;
+    route: any;
+    sessionId: string;
+    commandsDisabledForAgent: boolean;
+  },
+): Promise<void> {
+  const {
+    runtime, cfg, napCatCfg,
+    userId, groupId, isGroup, senderName,
+    messageText, messageId, replyCheckpointTs,
+    staleGroupActivityVersion,
+  } = opts;
+  if (!isGroup || groupId == null) {
+    throw new Error("persona mode is currently supported for group turns only");
+  }
+
+  const personaCfg = napCatCfg?.persona ?? {};
+  const coreAgentId = personaCfg.coreAgentId ?? "persona-core";
+  const voiceAgentId = personaCfg.voiceAgentId ?? "voice-organ";
+  const clearEmoji = await maybeSetThinkingEmoji(messageId, false);
+  let deliveredReply = false;
+  let deliveredReplyText = "";
+  let personaDraftText = "";
+  let contextExcerpt = "";
+
+  try {
+    const chatContext = buildGroupSectionContext(groupId, opts.rawMessageText ?? messageText);
+    const imageContext = buildDualBrainSupplementalContext(messageText);
+    const engagement = getGroupEngagementState(groupId);
+    const anchor = getGroupReplyAnchor(groupId);
+    const personaSessionKey = `agent:${coreAgentId}:napcat:group:${groupId}`;
+    const personaInput = [
+      "<operating_mode>chat</operating_mode>",
+      "",
+      "<chat_context>",
+      extractTaggedBlock(chatContext, "chat_context"),
+      "</chat_context>",
+      "",
+      "<engagement_state>",
+      `talk_value: ${engagement.talkValue.toFixed(2)}`,
+      `cooldown_until: ${engagement.cooldownUntil ? new Date(engagement.cooldownUntil).toLocaleString("zh-CN") : "0"}`,
+      `last_directed_ts: ${engagement.lastDirectedTs ? new Date(engagement.lastDirectedTs).toLocaleString("zh-CN") : "0"}`,
+      `last_bot_reply_ts: ${engagement.lastBotReplyTs ? new Date(engagement.lastBotReplyTs).toLocaleString("zh-CN") : "0"}`,
+      `recent_response_success: ${engagement.recentResponseSuccess}`,
+      "</engagement_state>",
+      anchor ? [
+        "",
+        "<reply_anchor>",
+        anchor.lastReplyTs ? `last_bot_reply_time: ${new Date(anchor.lastReplyTs).toLocaleString("zh-CN")}` : "",
+        anchor.lastBotReplyText ? `last_bot_reply: ${anchor.lastBotReplyText}` : "",
+        anchor.lastBotReplyExcerpt ? `recent_before_unreplied:\n${anchor.lastBotReplyExcerpt}` : "",
+        "</reply_anchor>",
+      ].filter(Boolean).join("\n") : "",
+      imageContext,
+      "",
+      "<task>",
+      "请判断这次是否应该说话；如果应该，说出你自己想表达的核心回复，并严格输出 persona-core.turn.v3 JSON。",
+      "</task>",
+    ].filter(Boolean).join("\n");
+    contextExcerpt = extractTaggedBlock(chatContext, "chat_context");
+
+    api.logger?.info?.(
+      `[napcat] ▶ persona-core turn for group ${groupId}, coreAgent=${coreAgentId}, coreSession=${personaSessionKey}`,
+    );
+    const personaResult = await runAgentTextViaRuntime(api, {
+      runtime,
+      cfg,
+      agentId: coreAgentId,
+      sessionKey: personaSessionKey,
+      inputText: personaInput,
+      userId,
+      groupId,
+      isGroup,
+      senderName,
+      replyTarget: `napcat:group:${groupId}`,
+    });
+    if (personaResult.status === "approval-pending" || personaResult.status === "approval-unavailable") {
+      const pendingText = buildPersonaPendingReply(personaResult.status);
+      registerPendingApprovalSurface(`group:${groupId}`, {
+        groupId,
+        chatContextExcerpt: extractTaggedBlock(chatContext, "chat_context"),
+        voiceAgentId,
+        gatewayPort: cfg?.gateway?.port ?? 18789,
+        gatewayToken: cfg?.gateway?.auth?.token ?? "",
+      });
+      api.logger?.info?.(
+        `[napcat] persona-core waiting on approval for group ${groupId}: status=${personaResult.status}`,
+      );
+      await clearEmoji();
+      await deliverNapCatPayload({
+        api,
+        cfg,
+        payload: { text: pendingText },
+        info: { kind: "final" },
+        ctxNapcat: { userId, groupId, isGroup, senderName },
+      });
+      return;
+    }
+    const personaRaw = personaResult.finalText;
+    const turn = normalizePersonaTurn(personaRaw);
+
+    if (staleGroupActivityVersion != null && getGroupActivityVersion(groupId) !== staleGroupActivityVersion) {
+      api.logger?.info?.(`[napcat] suppressing stale persona turn for group ${groupId}`);
+      return;
+    }
+
+    const personaAction = turn.decision.action;
+    const normalizedFinalText = turn.delivery.final_text.trim();
+    const shouldSpeak = personaAction === "speak" || normalizedFinalText.length > 0;
+
+    if (!shouldSpeak) {
+      api.logger?.info?.(`[napcat] persona-core decided silence for group ${groupId}`);
+      return;
+    }
+
+    if (personaAction !== "speak" && normalizedFinalText.length > 0) {
+      api.logger?.warn?.(
+        `[napcat] persona-core returned non-empty delivery.final_text while action=${personaAction}; treating as speak for compatibility`,
+      );
+    }
+
+    let finalReply = normalizedFinalText;
+    personaDraftText = finalReply;
+    if (!finalReply) {
+      throw new Error("persona-core returned empty delivery.final_text");
+    }
+
+    const shouldUseVoice = personaCfg.voiceOnGroupOnly !== false ? isGroup : true;
+    if (shouldUseVoice) {
+      try {
+        const voiceSessionKey = `agent:${voiceAgentId}:surface:group:${groupId}`;
+        const voiceInput = [
+          "<operating_mode>surface</operating_mode>",
+          "",
+          "<chat_context_excerpt>",
+          extractTaggedBlock(chatContext, "chat_context"),
+          "</chat_context_excerpt>",
+          "",
+          "<persona_packet>",
+          JSON.stringify({
+            world_model: turn.world_model,
+            draft: {
+              reply_to: turn.delivery.reply_to,
+              core_text: finalReply,
+            },
+          }, null, 2),
+          "</persona_packet>",
+          "",
+          "<task>",
+          "请把 persona-core 的 core_text 改写成更自然、更像群友的一句话。",
+          "除非原句已经几乎最优、再改只会变差，否则不要原样照抄。",
+          "请只输出 voice-organ.turn.v2 JSON。",
+          "</task>",
+        ].join("\n");
+
+        api.logger?.info?.(
+          `[napcat] ▶ voice-organ turn for group ${groupId}, voiceAgent=${voiceAgentId}, voiceSession=${voiceSessionKey}`,
+        );
+        const voicedResult = await runAgentTextViaRuntime(api, {
+          runtime,
+          cfg,
+          agentId: voiceAgentId,
+          sessionKey: voiceSessionKey,
+          inputText: voiceInput,
+          userId,
+          groupId,
+          isGroup,
+          senderName,
+          replyTarget: `napcat:group:${groupId}`,
+        });
+        const voicedRaw = voicedResult.finalText;
+        const voiced = normalizeVoiceText(voicedRaw);
+        if (voiced.trim()) finalReply = voiced.trim();
+      } catch (err: any) {
+        api.logger?.warn?.(`[napcat] voice-organ failed, using persona-core text: ${err?.message}`);
+      }
+    }
+
+    if (staleGroupActivityVersion != null && getGroupActivityVersion(groupId) !== staleGroupActivityVersion) {
+      api.logger?.info?.(`[napcat] suppressing stale persona reply for group ${groupId}`);
+      return;
+    }
+
+    await clearEmoji();
+    await deliverNapCatPayload({
+      api,
+      cfg,
+      payload: { text: finalReply },
+      info: { kind: "final" },
+      ctxNapcat: { userId, groupId, isGroup, senderName },
+    });
+    deliveredReply = true;
+    deliveredReplyText = finalReply.trim();
+  } finally {
+    await clearEmoji();
+    if (deliveredReply) {
+      insertReflectionSample({
+        groupId,
+        contextExcerpt,
+        personaDraft: personaDraftText || deliveredReplyText,
+        voiceFinal: deliveredReplyText,
+      });
+      const anchorTs = replyCheckpointTs && replyCheckpointTs > 0 ? replyCheckpointTs : Date.now();
+      updateGroupReplyCheckpoint(groupId, anchorTs);
+      updateGroupReplyAnchor(groupId, {
+        lastReplyTs: anchorTs,
+        replyText: deliveredReplyText,
+        excerpt: buildReplyAnchorExcerpt(groupId),
+      });
+      markGroupReplyObserved(groupId, anchorTs);
+    }
+  }
+}
+
+async function dispatchToAISingleBrain(
+  api: any,
+  opts: {
+    runtime: any;
+    cfg: any;
+    napCatCfg: any;
+    config: any;
+    userId: number;
+    groupId: number | undefined;
+    isGroup: boolean;
+    senderName: string;
+    messageText: string;
+    rawMessageText?: string;
+    messageId: number | undefined;
+    isPeriodicCheck?: boolean;
+    replyCheckpointTs?: number;
+    staleGroupActivityVersion?: number;
+  },
+  dispatchMeta: {
+    accountId: string;
+    replyTarget: string;
+    route: any;
+    sessionId: string;
+    commandsDisabledForAgent: boolean;
+  },
+): Promise<void> {
+  const {
+    runtime, cfg, napCatCfg,
+    userId, groupId, isGroup,
+    senderName, messageText,
+    messageId, isPeriodicCheck, replyCheckpointTs,
+  } = opts;
+  const rawMessageText = opts.rawMessageText ?? messageText;
+  const { buildPendingHistoryContextFromMap, recordPendingHistoryEntry, clearHistoryEntriesIfEnabled } = getSdk();
+  const staleGroupActivityVersion = opts.staleGroupActivityVersion;
+  const { accountId, replyTarget, route, sessionId, commandsDisabledForAgent } = dispatchMeta;
 
   const storePath = runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
     agentId: route.agentId,
@@ -397,7 +919,7 @@ async function dispatchToAI(
   }
 
   // ─── 构建分发上下文 ───
-  const effectiveAgentBody = isPeriodicCheck ? messageText : rawMessageText;
+  const effectiveAgentBody = messageText;
   const ctxPayload = {
     Body: body,
     BodyForAgent: effectiveAgentBody,
@@ -457,21 +979,7 @@ async function dispatchToAI(
     return;
   }
 
-  // ─── 思考表情（巡检时不加） ───
-  let emojiAdded = false;
-  if (messageId != null && !isPeriodicCheck) {
-    try {
-      await setMsgEmojiLike(messageId, 60, true);
-      emojiAdded = true;
-    } catch { /* not supported */ }
-  }
-
-  const clearEmoji = async () => {
-    if (emojiAdded && messageId != null) {
-      try { await setMsgEmojiLike(messageId, 60, false); } catch { }
-      emojiAdded = false;
-    }
-  };
+  const clearEmoji = await maybeSetThinkingEmoji(messageId, Boolean(isPeriodicCheck));
 
   // ─── 分发消息给 AI 并处理回复 ───
   api.logger?.info?.(
@@ -483,6 +991,8 @@ async function dispatchToAI(
   setActiveReplySessionId(replySessionId);
 
   const getConfig = () => getNapCatConfig(api);
+  let deliveredReply = false;
+  let deliveredReplyText = "";
 
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -490,121 +1000,28 @@ async function dispatchToAI(
       cfg,
       dispatcherOptions: {
         deliver: async (payload: unknown, info: { kind: string }) => {
+          if (isPeriodicCheck && groupId != null && staleGroupActivityVersion != null) {
+            const currentVersion = getGroupActivityVersion(groupId);
+            if (currentVersion !== staleGroupActivityVersion) {
+              api.logger?.info?.(
+                `[napcat] suppressing stale periodic reply for group ${groupId}: expectedActivity=${staleGroupActivityVersion} currentActivity=${currentVersion}`,
+              );
+              return;
+            }
+          }
           await clearEmoji();
-
-          const p = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
-          const replyText = typeof p === "string" ? p : (p?.text ?? p?.body ?? "");
-          const mediaUrl = typeof p === "string" ? undefined : (p?.mediaUrl ?? p?.mediaUrls?.[0]);
-          const trimmed = (replyText || "").trim();
-
-          api.logger?.info?.(`[napcat] ▶ AI reply (kind=${info.kind}): text="${trimmed.slice(0, 120)}" mediaUrl=${mediaUrl ?? "none"}`);
-
-          // NO_REPLY 表示 AI 认为不需要回复
-          if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY")) && !mediaUrl) {
-            api.logger?.info?.(`[napcat] ▶ AI replied NO_REPLY, skipping`);
-            return;
-          }
-
-          const { userId: uid, groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
-
-          // ── 1. 提取 <qqimg>/<qqvideo>/<qqfile> 标签 ──
-          const qqImages: string[] = [];
-          const qqVideos: string[] = [];
-          const qqFiles: string[] = [];
-          let cleanedText = trimmed;
-
-          // <qqimg>path_or_url</qqimg> (及常见变体 qqimage, qq_img 等)
-          const qqImgRegex = /<\s*qq(?:img|image|pic|_img)\s*>([\s\S]*?)<\s*\/\s*qq(?:img|image|pic|_img)\s*>/gi;
-          let qqMatch: RegExpExecArray | null;
-          while ((qqMatch = qqImgRegex.exec(cleanedText)) !== null) {
-            const val = qqMatch[1].trim();
-            if (val) qqImages.push(val);
-          }
-          cleanedText = cleanedText.replace(qqImgRegex, "").trim();
-
-          // <qqvideo>path_or_url</qqvideo>
-          const qqVideoRegex = /<\s*qqvideo\s*>([\s\S]*?)<\s*\/\s*qqvideo\s*>/gi;
-          while ((qqMatch = qqVideoRegex.exec(cleanedText)) !== null) {
-            const val = qqMatch[1].trim();
-            if (val) qqVideos.push(val);
-          }
-          cleanedText = cleanedText.replace(qqVideoRegex, "").trim();
-
-          // <qqfile>path_or_url</qqfile>
-          const qqFileRegex = /<\s*qqfile\s*>([\s\S]*?)<\s*\/\s*qqfile\s*>/gi;
-          while ((qqMatch = qqFileRegex.exec(cleanedText)) !== null) {
-            const val = qqMatch[1].trim();
-            if (val) qqFiles.push(val);
-          }
-          cleanedText = cleanedText.replace(qqFileRegex, "").trim();
-
-          const hasQqTags = qqImages.length > 0 || qqVideos.length > 0 || qqFiles.length > 0;
-          if (hasQqTags) {
-            api.logger?.info?.(`[napcat] extracted qq tags: ${qqImages.length} images, ${qqVideos.length} videos, ${qqFiles.length} files`);
-          }
-
-          // ── 2. 提取 markdown 图片和裸图片 URL ──
-          const imageUrlsFromText: string[] = [];
-          let textWithoutImages = cleanedText;
-
-          // ![alt](url)
-          const mdImageRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
-          let mdMatch: RegExpExecArray | null;
-          while ((mdMatch = mdImageRegex.exec(cleanedText)) !== null) {
-            const url = mdMatch[1];
-            if (/^https?:\/\//i.test(url)) imageUrlsFromText.push(url);
-          }
-          textWithoutImages = textWithoutImages.replace(mdImageRegex, "").trim();
-
-          // 裸图片 URL
-          const bareImageUrlRegex = /(?:^|\s)(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp|bmp)(?:\?\S*)?)/gi;
-          let bareMatch: RegExpExecArray | null;
-          while ((bareMatch = bareImageUrlRegex.exec(textWithoutImages)) !== null) {
-            const url = bareMatch[1];
-            if (!imageUrlsFromText.includes(url)) imageUrlsFromText.push(url);
-          }
-          if (imageUrlsFromText.length > 0) {
-            textWithoutImages = textWithoutImages.replace(bareImageUrlRegex, "").trim();
-          }
-
-          // ── 3. 合并所有图片来源 ──
-          const allImageUrls = [...(mediaUrl ? [mediaUrl] : []), ...qqImages, ...imageUrlsFromText];
-          const hasMedia = allImageUrls.length > 0 || qqVideos.length > 0 || qqFiles.length > 0;
-
-          const usePlain = getRenderMarkdownToPlain(cfg);
-          let textPlain = usePlain
-            ? markdownToPlain(hasMedia ? textWithoutImages : cleanedText)
-            : (hasMedia ? textWithoutImages : cleanedText);
-          textPlain = collapseDoubleNewlines(textPlain);
-
-          try {
-            // 发送文本
-            if (textPlain) {
-              if (ig && gid) await sendGroupMsg(gid, textPlain, getConfig);
-              else if (uid) await sendPrivateMsg(uid, textPlain, getConfig);
-            }
-            // 发送图片
-            for (const imgUrl of allImageUrls) {
-              api.logger?.info?.(`[napcat] sending image: ${imgUrl.slice(0, 80)}`);
-              if (ig && gid) await sendGroupImage(gid, imgUrl, getConfig);
-              else if (uid) await sendPrivateImage(uid, imgUrl, getConfig);
-            }
-            // 发送视频
-            for (const vidUrl of qqVideos) {
-              api.logger?.info?.(`[napcat] sending video: ${vidUrl.slice(0, 80)}`);
-              if (ig && gid) await sendGroupVideo(gid, vidUrl, getConfig);
-              else if (uid) await sendPrivateVideo(uid, vidUrl, getConfig);
-            }
-            // 发送文件
-            for (const filePath of qqFiles) {
-              const fileName = filePath.split("/").pop() || "file";
-              api.logger?.info?.(`[napcat] sending file: ${filePath.slice(0, 80)}`);
-              if (ig && gid) await uploadGroupFile(gid, filePath, fileName, getConfig);
-              else if (uid) await uploadPrivateFile(uid, filePath, fileName, getConfig);
-            }
-          } catch (e: any) {
-            api.logger?.error?.(`[napcat] deliver failed: ${e?.message}`);
-          }
+          await deliverNapCatPayload({
+            api,
+            cfg,
+            payload,
+            info,
+            ctxNapcat: (ctxPayload as any)._napcat || { userId, groupId, isGroup, senderName },
+          });
+          deliveredReply = true;
+          deliveredReplyText = extractReplyAnchorText(
+            typeof payload === "string" ? payload : (payload as any)?.text,
+            typeof payload === "string" ? "" : (payload as any)?.body,
+          );
 
           if (info.kind === "final" && clearHistoryEntriesIfEnabled) {
             clearHistoryEntriesIfEnabled({
@@ -634,12 +1051,800 @@ async function dispatchToAI(
     // 如果是群聊且发送过消息（未抛出异常或中途跳出），更新回复检查点。
     // 在整个过程完整结束后记录，确保真正的答复才会更新检查点。
     const { groupId: gid, isGroup: ig } = (ctxPayload as any)._napcat || {};
-    if (ig && gid) {
-       updateGroupCheckpoint(gid);
+    if (ig && gid && deliveredReply) {
+      const anchorTs = replyCheckpointTs && replyCheckpointTs > 0 ? replyCheckpointTs : Date.now();
+      updateGroupReplyCheckpoint(gid, anchorTs);
+      updateGroupReplyAnchor(gid, {
+        lastReplyTs: anchorTs,
+        replyText: deliveredReplyText,
+        excerpt: buildReplyAnchorExcerpt(gid),
+      });
+      markGroupReplyObserved(gid, anchorTs);
     }
     setActiveReplySessionId(null);
     clearActiveReplyTarget();
   }
+}
+
+async function maybeSummarizeGroupImagesToHistory(
+  api: any,
+  opts: {
+    cfg: any;
+    napCatCfg: any;
+    msg: OneBotMessage;
+    groupId: number;
+    dbMessageId: number;
+    enabled: boolean;
+  },
+): Promise<void> {
+  const { cfg, napCatCfg, msg, groupId, dbMessageId, enabled } = opts;
+  if (!enabled || napCatCfg.multimodalImagesEnabled === false) return;
+  const imageRefs = clampImageUrls(getImageUrls(msg), napCatCfg.multimodalImageMaxCount ?? 3);
+  if (imageRefs.length === 0) return;
+
+  const summaryAgentId = napCatCfg?.persona?.coreAgentId ?? "persona-core";
+  const imageSummary = await summarizeImagesWithResponses({
+    gatewayPort: cfg?.gateway?.port ?? 18789,
+    gatewayToken: cfg?.gateway?.auth?.token ?? "",
+    agentId: summaryAgentId,
+    inputText: buildVisionSummaryPrompt(imageRefs.length),
+    imageUrls: imageRefs,
+  });
+
+  attachGroupMessageImageSummary(dbMessageId, imageSummary);
+  api.logger?.info?.(`[napcat] cached group image summary for group ${groupId}, messageRow=${dbMessageId}`);
+}
+
+async function deliverNapCatPayload(params: {
+  api: any;
+  cfg: any;
+  payload: unknown;
+  info: { kind: string };
+  ctxNapcat: { userId?: number; groupId?: number; isGroup?: boolean; senderName?: string };
+}): Promise<void> {
+  const { api, cfg, payload, info, ctxNapcat } = params;
+  const p = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
+  const replyText = typeof p === "string" ? p : (p?.text ?? p?.body ?? "");
+  const mediaUrl = typeof p === "string" ? undefined : (p?.mediaUrl ?? p?.mediaUrls?.[0]);
+  const trimmed = (replyText || "").trim();
+
+  api.logger?.info?.(`[napcat] ▶ AI reply (kind=${info.kind}): text="${trimmed.slice(0, 120)}" mediaUrl=${mediaUrl ?? "none"}`);
+
+  if ((!trimmed || trimmed === "NO_REPLY" || trimmed.endsWith("NO_REPLY")) && !mediaUrl) {
+    api.logger?.info?.("[napcat] ▶ AI replied NO_REPLY, skipping");
+    return;
+  }
+
+  const { userId: uid, groupId: gid, isGroup: ig } = ctxNapcat;
+  const getConfig = () => getNapCatConfig(api);
+
+  const qqImages: string[] = [];
+  const qqVideos: string[] = [];
+  const qqFiles: string[] = [];
+  let cleanedText = trimmed;
+
+  const qqImgRegex = /<\s*qq(?:img|image|pic|_img)\s*>([\s\S]*?)<\s*\/\s*qq(?:img|image|pic|_img)\s*>/gi;
+  let qqMatch: RegExpExecArray | null;
+  while ((qqMatch = qqImgRegex.exec(cleanedText)) !== null) {
+    const val = qqMatch[1].trim();
+    if (val) qqImages.push(val);
+  }
+  cleanedText = cleanedText.replace(qqImgRegex, "").trim();
+
+  const qqVideoRegex = /<\s*qqvideo\s*>([\s\S]*?)<\s*\/\s*qqvideo\s*>/gi;
+  while ((qqMatch = qqVideoRegex.exec(cleanedText)) !== null) {
+    const val = qqMatch[1].trim();
+    if (val) qqVideos.push(val);
+  }
+  cleanedText = cleanedText.replace(qqVideoRegex, "").trim();
+
+  const qqFileRegex = /<\s*qqfile\s*>([\s\S]*?)<\s*\/\s*qqfile\s*>/gi;
+  while ((qqMatch = qqFileRegex.exec(cleanedText)) !== null) {
+    const val = qqMatch[1].trim();
+    if (val) qqFiles.push(val);
+  }
+  cleanedText = cleanedText.replace(qqFileRegex, "").trim();
+
+  if (qqImages.length > 0 || qqVideos.length > 0 || qqFiles.length > 0) {
+    api.logger?.info?.(`[napcat] extracted qq tags: ${qqImages.length} images, ${qqVideos.length} videos, ${qqFiles.length} files`);
+  }
+
+  const imageUrlsFromText: string[] = [];
+  let textWithoutImages = cleanedText;
+
+  const mdImageRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+  let mdMatch: RegExpExecArray | null;
+  while ((mdMatch = mdImageRegex.exec(cleanedText)) !== null) {
+    const url = mdMatch[1];
+    if (/^https?:\/\//i.test(url)) imageUrlsFromText.push(url);
+  }
+  textWithoutImages = textWithoutImages.replace(mdImageRegex, "").trim();
+
+  const bareImageUrlRegex = /(?:^|\s)(https?:\/\/\S+\.(?:png|jpg|jpeg|gif|webp|bmp)(?:\?\S*)?)/gi;
+  let bareMatch: RegExpExecArray | null;
+  while ((bareMatch = bareImageUrlRegex.exec(textWithoutImages)) !== null) {
+    const url = bareMatch[1];
+    if (!imageUrlsFromText.includes(url)) imageUrlsFromText.push(url);
+  }
+  if (imageUrlsFromText.length > 0) {
+    textWithoutImages = textWithoutImages.replace(bareImageUrlRegex, "").trim();
+  }
+
+  const allImageUrls = [...(mediaUrl ? [mediaUrl] : []), ...qqImages, ...imageUrlsFromText];
+  const hasMedia = allImageUrls.length > 0 || qqVideos.length > 0 || qqFiles.length > 0;
+
+  const usePlain = getRenderMarkdownToPlain(cfg);
+  let textPlain = usePlain
+    ? markdownToPlain(hasMedia ? textWithoutImages : cleanedText)
+    : (hasMedia ? textWithoutImages : cleanedText);
+  textPlain = collapseDoubleNewlines(textPlain);
+
+  try {
+    if (textPlain) {
+      if (ig && gid) await sendGroupMsg(gid, textPlain, getConfig);
+      else if (uid) await sendPrivateMsg(uid, textPlain, getConfig);
+    }
+    for (const imgUrl of allImageUrls) {
+      api.logger?.info?.(`[napcat] sending image: ${imgUrl.slice(0, 80)}`);
+      if (ig && gid) await sendGroupImage(gid, imgUrl, getConfig);
+      else if (uid) await sendPrivateImage(uid, imgUrl, getConfig);
+    }
+    for (const vidUrl of qqVideos) {
+      api.logger?.info?.(`[napcat] sending video: ${vidUrl.slice(0, 80)}`);
+      if (ig && gid) await sendGroupVideo(gid, vidUrl, getConfig);
+      else if (uid) await sendPrivateVideo(uid, vidUrl, getConfig);
+    }
+    for (const filePath of qqFiles) {
+      const fileName = filePath.split("/").pop() || "file";
+      api.logger?.info?.(`[napcat] sending file: ${filePath.slice(0, 80)}`);
+      if (ig && gid) await uploadGroupFile(gid, filePath, fileName, getConfig);
+      else if (uid) await uploadPrivateFile(uid, filePath, fileName, getConfig);
+    }
+  } catch (e: any) {
+    api.logger?.error?.(`[napcat] deliver failed: ${e?.message}`);
+  }
+}
+
+async function maybeSetThinkingEmoji(messageId: number | undefined, isPeriodicCheck: boolean): Promise<() => Promise<void>> {
+  let emojiAdded = false;
+  if (messageId != null && !isPeriodicCheck) {
+    try {
+      await setMsgEmojiLike(messageId, 60, true);
+      emojiAdded = true;
+    } catch { /* not supported */ }
+  }
+
+  return async () => {
+    if (emojiAdded && messageId != null) {
+      try { await setMsgEmojiLike(messageId, 60, false); } catch { }
+      emojiAdded = false;
+    }
+  };
+}
+
+function resolveNapCatDispatchMeta(params: {
+  cfg: any;
+  runtime: any;
+  config: any;
+  napCatCfg: any;
+  isGroup: boolean;
+  userId: number;
+  groupId: number | undefined;
+}): {
+  accountId: string;
+  replyTarget: string;
+  route: any;
+  sessionId: string;
+  commandsDisabledForAgent: boolean;
+} {
+  const { cfg, runtime, config, napCatCfg, isGroup, userId, groupId } = params;
+  const accountId = config.accountId ?? "default";
+  const replyTarget = isGroup ? `napcat:group:${groupId}` : `napcat:${userId}`;
+  const route = resolveNapCatRoute({
+    cfg,
+    runtime,
+    accountId,
+    isGroup,
+    userId,
+    groupId,
+  }) ?? { agentId: "main", accountId, sessionKey: replyTarget.toLowerCase(), matchedBy: "default" };
+  const sessionId = String(route.sessionKey ?? replyTarget).toLowerCase();
+  const commandsDisabledForAgent = (napCatCfg.disableCommandsForAgents ?? ["persona-core", "voice-organ"]).includes(route.agentId);
+  return { accountId, replyTarget, route, sessionId, commandsDisabledForAgent };
+}
+
+function getPrimaryAdminUserId(napCatCfg: any): number | null {
+  const admins = Array.isArray(napCatCfg?.admins) ? napCatCfg.admins : [];
+  for (const admin of admins) {
+    const asNumber = Number(admin);
+    if (Number.isFinite(asNumber) && asNumber > 0) return asNumber;
+  }
+  return null;
+}
+
+function shouldHandleControlPlaneCommand(msg: OneBotMessage, napCatCfg: any): boolean {
+  if (msg.message_type !== "private") return false;
+  const primaryAdmin = getPrimaryAdminUserId(napCatCfg);
+  if (!primaryAdmin || Number(msg.user_id ?? 0) !== primaryAdmin) return false;
+  const text = getRawText(msg).trim();
+  return /^\/approve\b/i.test(text) || /^\/reflect\b/i.test(text);
+}
+
+async function handleControlPlaneCommand(api: any, params: {
+  msg: OneBotMessage;
+  runtime: any;
+  cfg: any;
+  config: any;
+  napCatCfg: any;
+}): Promise<void> {
+  const { msg, runtime, cfg, config, napCatCfg } = params;
+  const text = getRawText(msg).trim();
+  if (/^\/approve\b/i.test(text)) {
+    await dispatchControlPlaneNativeCommand(api, {
+      runtime,
+      cfg,
+      config,
+      napCatCfg,
+      msg,
+      commandText: text,
+    });
+    return;
+  }
+  if (/^\/reflect\b/i.test(text)) {
+    await dispatchPersonaReflectionCommand(api, {
+      runtime,
+      cfg,
+      napCatCfg,
+      msg,
+      commandText: text,
+    });
+  }
+}
+
+async function dispatchControlPlaneNativeCommand(api: any, params: {
+  runtime: any;
+  cfg: any;
+  config: any;
+  napCatCfg: any;
+  msg: OneBotMessage;
+  commandText: string;
+}): Promise<void> {
+  const { runtime, cfg, config, napCatCfg, msg, commandText } = params;
+  const userId = Number(msg.user_id);
+  const senderName = getSenderName(msg);
+  const dispatchMeta = resolveNapCatDispatchMeta({
+    cfg,
+    runtime,
+    config,
+    napCatCfg,
+    isGroup: false,
+    userId,
+    groupId: undefined,
+  });
+  const { accountId, replyTarget, route } = dispatchMeta;
+  const chatType = "direct";
+  const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
+  const body =
+    runtime.channel.reply?.formatInboundEnvelope?.({
+      channel: "NapCat",
+      from: senderName,
+      timestamp: Date.now(),
+      body: commandText,
+      chatType,
+      sender: { name: senderName, id: String(userId) },
+      envelope: envelopeOptions,
+    }) ?? { content: [{ type: "text", text: commandText }] };
+
+  const ctxPayload = {
+    Body: body,
+    BodyForAgent: commandText,
+    BodyForCommands: commandText,
+    RawBody: commandText,
+    CommandBody: commandText,
+    From: replyTarget,
+    To: replyTarget,
+    SessionKey: dispatchMeta.sessionId,
+    AccountId: route.accountId ?? accountId,
+    ChatType: chatType,
+    ConversationLabel: `${replyTarget}:control`,
+    SenderName: senderName,
+    SenderId: String(userId),
+    Provider: "napcat",
+    Surface: "napcat",
+    MessageSid: `napcat-control-${Date.now()}`,
+    Timestamp: Date.now(),
+    OriginatingChannel: "napcat",
+    OriginatingTo: replyTarget,
+    CommandAuthorized: true,
+    DeliveryContext: {
+      channel: "napcat",
+      to: replyTarget,
+      accountId: route.accountId ?? accountId,
+    },
+    _napcat: { userId, groupId: undefined, isGroup: false, senderName },
+  };
+
+  api.logger?.info?.(
+    `[napcat] ▶ control-plane command dispatch route=${route.agentId} session=${dispatchMeta.sessionId} replyTarget=${replyTarget} ` +
+    `origin=${ctxPayload.OriginatingChannel}:${ctxPayload.OriginatingTo} ` +
+    `delivery=${formatDeliveryContextForLog(ctxPayload.DeliveryContext)} text="${commandText.slice(0, 120)}"`,
+  );
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload: unknown, info: { kind: string }) => {
+        await deliverNapCatPayload({
+          api,
+          cfg,
+          payload,
+          info,
+          ctxNapcat: { userId, groupId: undefined, isGroup: false, senderName },
+        });
+      },
+      onError: async (err: any) => {
+        api.logger?.error?.(`[napcat] control-plane command error: ${err}`);
+      },
+    },
+  });
+}
+
+async function dispatchPersonaReflectionCommand(api: any, params: {
+  runtime: any;
+  cfg: any;
+  napCatCfg: any;
+  msg: OneBotMessage;
+  commandText: string;
+}): Promise<void> {
+  const { runtime, cfg, napCatCfg, msg, commandText } = params;
+  const match = commandText.match(/^\/reflect(?:\s+(\d+))?(?:\s+(\d+))?$/i);
+  const requestedGroupId = match?.[1] ? Number(match[1]) : undefined;
+  const requestedLimit = match?.[2] ? Math.max(1, Math.min(20, Number(match[2]))) : 5;
+  const samples = getPendingReflectionSamples(requestedLimit, requestedGroupId);
+  const userId = Number(msg.user_id);
+
+  if (samples.length === 0) {
+    await sendPrivateMsg(userId, "没有待反思样本。");
+    return;
+  }
+
+  const personaAgentId = napCatCfg?.persona?.coreAgentId ?? "persona-core";
+  const reflectionSessionKey = requestedGroupId != null
+    ? `agent:${personaAgentId}:reflection:group:${requestedGroupId}`
+    : `agent:${personaAgentId}:reflection:global`;
+  api.logger?.info?.(
+    `[napcat] ▶ reflection command session=${reflectionSessionKey} samples=${samples.length} ` +
+    `requestedGroup=${requestedGroupId ?? "global"} replyTarget=napcat:${userId}`,
+  );
+  const packets = samples.map((sample, index) => [
+    `<sample_${index + 1}>`,
+    `group_id: ${sample.group_id}`,
+    `created_at: ${new Date(sample.created_at).toLocaleString("zh-CN")}`,
+    `context_excerpt:`,
+    sample.context_excerpt,
+    `persona_draft: ${sample.persona_draft}`,
+    `voice_final: ${sample.voice_final}`,
+    `edit_distance_summary: ${buildEditDistanceSummary(sample.persona_draft, sample.voice_final)}`,
+    `</sample_${index + 1}>`,
+  ].join("\n")).join("\n\n");
+
+  const inputText = [
+    "<operating_mode>reflection</operating_mode>",
+    "",
+    "<reflection_packets>",
+    packets,
+    "</reflection_packets>",
+    "",
+    "<memory_candidates>",
+    samples
+      .map((sample) => `group ${sample.group_id}: ${sample.voice_final}`)
+      .join("\n"),
+    "</memory_candidates>",
+    "",
+    "<task>",
+    "请回顾这些样本，判断哪些表达变化值得吸收。必要时更新当前工作区中的记忆或人格文件，然后用简短中文总结你这次做了什么。",
+    "</task>",
+  ].join("\n");
+
+  try {
+    const summaryResult = await runAgentTextViaRuntime(api, {
+      runtime,
+      cfg,
+      agentId: personaAgentId,
+      sessionKey: reflectionSessionKey,
+      inputText,
+      userId,
+      groupId: undefined,
+      isGroup: false,
+      senderName: getSenderName(msg),
+      replyTarget: `napcat:${userId}`,
+    });
+    const summary = summaryResult.finalText;
+
+    markReflectionSamplesReflected(samples.map((sample) => sample.id));
+    api.logger?.info?.(
+      `[napcat] ▶ reflection private send success user=${userId} chars=${(summary || "").length}`,
+    );
+    await sendPrivateMsg(userId, summary || `已完成 reflection，共处理 ${samples.length} 条样本。`);
+  } catch (err: any) {
+    api.logger?.error?.(`[napcat] reflection command failed: ${err?.message}`);
+    api.logger?.info?.(
+      `[napcat] ▶ reflection private send failure user=${userId} reason="${err?.message?.slice(0, 120) || "未知错误"}"`,
+    );
+    await sendPrivateMsg(
+      userId,
+      `本次 reflection 失败：${err?.message?.slice(0, 120) || "未知错误"}`,
+    );
+  }
+}
+
+async function runAgentTextViaRuntime(
+  api: any,
+  params: {
+    runtime: any;
+    cfg: any;
+    agentId: string;
+    sessionKey: string;
+    inputText: string;
+    userId: number;
+    groupId: number | undefined;
+    isGroup: boolean;
+    senderName: string;
+    replyTarget: string;
+  },
+): Promise<RuntimeAgentRunResult> {
+  const { runtime, cfg, agentId, sessionKey, inputText, userId, groupId, isGroup, senderName, replyTarget } = params;
+  const accountId = "default";
+  const chatType = isGroup ? "group" : "direct";
+  const dispatchStartedAt = Date.now();
+  const storePath = runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
+    agentId,
+  }) ?? "";
+  const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
+  const formattedBody =
+    runtime.channel.reply?.formatInboundEnvelope?.({
+      channel: "NapCat",
+      from: senderName,
+      timestamp: Date.now(),
+      body: inputText,
+      chatType,
+      sender: { name: senderName, id: String(userId) },
+      envelope: envelopeOptions,
+    }) ?? { content: [{ type: "text", text: inputText }] };
+
+  const ctxPayload = {
+    Body: formattedBody,
+    BodyForAgent: inputText,
+    BodyForCommands: inputText,
+    RawBody: inputText,
+    CommandBody: inputText,
+    From: replyTarget,
+    To: replyTarget,
+    SessionKey: sessionKey,
+    AccountId: accountId,
+    ChatType: chatType,
+    ConversationLabel: replyTarget,
+    SenderName: senderName,
+    SenderId: String(userId),
+    Provider: "napcat",
+    Surface: "napcat",
+    MessageSid: `napcat-runtime-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    Timestamp: Date.now(),
+    OriginatingChannel: "napcat",
+    OriginatingTo: replyTarget,
+    CommandAuthorized: false,
+    DeliveryContext: {
+      channel: "napcat",
+      to: replyTarget,
+      accountId,
+    },
+    _napcat: { userId, groupId, isGroup, senderName },
+  };
+
+  api.logger?.info?.(
+    `[napcat] ▶ runtime dispatch agent=${agentId} sessionKey=${sessionKey} replyTarget=${replyTarget} ` +
+    `storePath=${storePath || "(empty)"} origin=${ctxPayload.OriginatingChannel}:${ctxPayload.OriginatingTo} ` +
+    `delivery=${formatDeliveryContextForLog(ctxPayload.DeliveryContext)} chatType=${chatType}`,
+  );
+
+  if (runtime.channel.session?.recordInboundSession) {
+    await runtime.channel.session.recordInboundSession({
+      storePath,
+      sessionKey,
+      ctx: ctxPayload,
+      updateLastRoute: {
+        sessionKey,
+        channel: "napcat",
+        to: replyTarget,
+        accountId,
+      },
+      onRecordError: (err: any) => api.logger?.warn?.(`[napcat] runtime recordInboundSession(${agentId}): ${err}`),
+    });
+    api.logger?.info?.(
+      `[napcat] ▶ runtime session recorded agent=${agentId} sessionKey=${sessionKey} ` +
+      `updateLastRoute=napcat:${replyTarget} account=${accountId}`,
+    );
+  }
+
+  if (runtime.channel.activity?.record) {
+    runtime.channel.activity.record({ channel: "napcat", accountId, direction: "inbound" });
+  }
+
+  let finalText = "";
+  let deliverError: Error | null = null;
+  const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload: unknown, info: { kind: string }) => {
+        if (info.kind !== "final") return;
+        finalText = extractReplyAnchorText(
+          typeof payload === "string" ? payload : (payload as any)?.text,
+          typeof payload === "string" ? "" : (payload as any)?.body,
+        );
+      },
+      onError: async (err: any) => {
+        deliverError = err instanceof Error ? err : new Error(String(err));
+      },
+    },
+  });
+
+  if (deliverError) throw deliverError;
+  if (!result?.queuedFinal) {
+    throw new Error(`runtime agent ${agentId} produced no final reply`);
+  }
+  const approvalState = await detectApprovalStateFromSession({
+    storePath,
+    sessionKey,
+    startedAtMs: dispatchStartedAt,
+  });
+  api.logger?.info?.(
+    `[napcat] ▶ runtime dispatch settled agent=${agentId} sessionKey=${sessionKey} ` +
+    `queuedFinal=${String(Boolean(result?.queuedFinal))} finalChars=${finalText.trim().length} ` +
+    `status=${approvalState.status}`,
+  );
+  return {
+    finalText: finalText.trim(),
+    status: approvalState.status,
+    approvalMessage: approvalState.message,
+    queuedFinal: Boolean(result?.queuedFinal),
+  };
+}
+
+function formatDeliveryContextForLog(deliveryContext: unknown): string {
+  if (!deliveryContext || typeof deliveryContext !== "object") return "(none)";
+  const channel = String((deliveryContext as any).channel ?? "").trim() || "(none)";
+  const to = String((deliveryContext as any).to ?? "").trim() || "(none)";
+  const accountId = String((deliveryContext as any).accountId ?? "").trim() || "(none)";
+  const threadId = (deliveryContext as any).threadId;
+  return `${channel}:${to}:account=${accountId}${threadId != null ? `:thread=${String(threadId)}` : ""}`;
+}
+
+function buildPersonaPendingReply(status: "approval-pending" | "approval-unavailable"): string {
+  if (status === "approval-pending") {
+    return "我先去查，这一步需要审批，批完我继续回你。";
+  }
+  return "我先去申请一下查询权限，批完再继续给你补结果。";
+}
+
+async function detectApprovalStateFromSession(params: {
+  storePath: string;
+  sessionKey: string;
+  startedAtMs: number;
+}): Promise<{ status: RuntimeAgentRunResult["status"]; message: string }> {
+  if (!params.storePath) {
+    return { status: "completed", message: "" };
+  }
+
+  try {
+    const storeRaw = await readFile(params.storePath, "utf8");
+    const store = JSON.parse(storeRaw) as Record<string, { sessionId?: string; sessionFile?: string }>;
+    const entry = store[params.sessionKey];
+    if (!entry?.sessionId && !entry?.sessionFile) {
+      return { status: "completed", message: "" };
+    }
+
+    const sessionFile = entry.sessionFile
+      ? String(entry.sessionFile)
+      : path.join(path.dirname(params.storePath), `${String(entry.sessionId)}.jsonl`);
+    const sessionRaw = await readFile(sessionFile, "utf8");
+    const lines = sessionRaw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-40);
+
+    let latestStatus: "approval-pending" | "approval-unavailable" | null = null;
+    let latestMessage = "";
+
+    for (const line of lines) {
+      let parsed: any;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      const timestampMs = Date.parse(String(parsed?.timestamp ?? ""));
+      if (Number.isFinite(timestampMs) && timestampMs < params.startedAtMs - 2000) {
+        continue;
+      }
+
+      if (parsed?.type !== "message") continue;
+      if (parsed?.message?.role !== "toolResult") continue;
+      const details = parsed?.message?.details;
+      if (!details || typeof details !== "object") continue;
+      if (details.status !== "approval-pending" && details.status !== "approval-unavailable") continue;
+
+      latestStatus = details.status;
+      latestMessage = String(
+        parsed?.message?.content?.[0]?.text ??
+        details.warningText ??
+        "",
+      ).trim();
+    }
+
+    return latestStatus
+      ? { status: latestStatus, message: latestMessage }
+      : { status: "completed", message: "" };
+  } catch {
+    return { status: "completed", message: "" };
+  }
+}
+
+function buildEditDistanceSummary(before: string, after: string): string {
+  const a = String(before ?? "").trim();
+  const b = String(after ?? "").trim();
+  if (!a && !b) return "both empty";
+  if (!a) return "persona draft empty, final text added";
+  if (!b) return "final text empty";
+  if (a === b) return "unchanged";
+  if (b.length < a.length) return "final text is shorter and tighter";
+  if (b.length > a.length) return "final text is more expanded or reshaped";
+  return "wording changed with similar length";
+}
+
+function shouldUseMultimodalImages(napCatCfg: any, imageUrls: string[]): boolean {
+  return napCatCfg.multimodalImagesEnabled !== false && imageUrls.length > 0;
+}
+
+function clampImageUrls(imageUrls: string[], maxCount: number): string[] {
+  const normalized = imageUrls
+    .map((url) => String(url ?? "").trim())
+    .filter((url) => /^https?:\/\//i.test(url) || url.startsWith("base64://") || url.startsWith("file://"));
+  return normalized.slice(0, Math.max(1, Number(maxCount || 1)));
+}
+
+function buildVisionSummaryPrompt(imageCount: number): string {
+  if (imageCount <= 1) {
+    return "请只观察当前这张图片，输出简短、客观的中文视觉摘要，不要回答用户问题，不要参考聊天历史。";
+  }
+  return `请只观察当前这 ${imageCount} 张图片，按“图片1/图片2/...”输出简短、客观的中文视觉摘要，不要回答用户问题，不要参考聊天历史。`;
+}
+
+function buildVisionQuestionPrompt(questionText: string, imageCount: number): string {
+  const cleaned = questionText.trim() || "请根据图片直接回答用户刚才的问题。";
+  if (imageCount <= 1) {
+    return `请只基于当前这张图片回答用户问题：${cleaned}`;
+  }
+  return `请只基于当前这 ${imageCount} 张图片回答用户问题：${cleaned}`;
+}
+
+function buildVisionQuestionPromptWithContext(questionText: string, imageCount: number, contextBlock: string): string {
+  const base = buildVisionQuestionPrompt(questionText, imageCount);
+  const context = extractTaggedBlock(contextBlock, "chat_context");
+  if (!context) return base;
+  return [
+    base,
+    "",
+    "补充语境：以下是当前这节群聊历史，仅用于帮助你理解这次问图问题，不要回答历史里没明确提到的内容。",
+    context,
+  ].join("\n");
+}
+
+function shouldUsePersonaReply(
+  napCatCfg: any,
+  params: {
+    isGroup: boolean;
+    groupId: number | undefined;
+    routeAgentId: string;
+  },
+): boolean {
+  const personaCfg = napCatCfg?.persona;
+  if (!personaCfg?.enabled) return false;
+  if (!params.isGroup) return false;
+  if (params.groupId == null) return false;
+  return true;
+}
+
+function buildGroupSectionContext(groupId: number, fallbackText: string): string {
+  const contextSource = getMessagesSinceLastReply(groupId, 100);
+  const contextLines = contextSource.length > 0
+    ? contextSource.map((m) => `[${m.senderName}]: ${m.body}`).join("\n")
+    : `[群聊]: ${fallbackText.trim()}`;
+  return `<chat_context>\n${contextLines}\n</chat_context>`;
+}
+
+function buildDualBrainSupplementalContext(messageText: string): string {
+  const imageContext = extractTaggedBlock(messageText, "image_context");
+  if (!imageContext) return "";
+  return `<image_context>\n${imageContext}\n</image_context>`;
+}
+
+function extractTaggedBlock(text: string, tagName: string): string {
+  const pattern = new RegExp(`<${tagName}>\\s*([\\s\\S]*?)\\s*</${tagName}>`, "i");
+  const match = text.match(pattern);
+  return match?.[1]?.trim() ?? "";
+}
+
+function buildReplyAnchorExcerpt(groupId: number): string {
+  const recent = getMessagesSinceLastReply(groupId, 4);
+  return recent
+    .map((m) => `[${m.senderName}]: ${m.body}`)
+    .join("\n")
+    .trim();
+}
+
+async function maybeBuildSectionImageContext(
+  api: any,
+  opts: {
+    cfg: any;
+    napCatCfg: any;
+    contextSource: Array<{ senderName: string; body: string; timestamp: number }>;
+    recentMessages: Array<{ senderName: string; body: string; timestamp: number }>;
+  },
+): Promise<string> {
+  const questionText = opts.recentMessages.map((m) => `[${m.senderName}]: ${m.body}`).join("\n").trim();
+  if (!looksLikeImageQuestion(questionText)) return "";
+
+  const imageRefs = collectImageRefsFromEntries(opts.contextSource);
+  if (imageRefs.length === 0) return "";
+
+  const summaryAgentId = opts.napCatCfg?.persona?.coreAgentId ?? "persona-core";
+  api.logger?.info?.(
+    `[napcat] ▶ analyzing section images for pending question, summaryAgent=${summaryAgentId}, images=${imageRefs.length}`,
+  );
+
+  const imageAnswer = await answerImagesWithResponses({
+    gatewayPort: opts.cfg?.gateway?.port ?? 18789,
+    gatewayToken: opts.cfg?.gateway?.auth?.token ?? "",
+    agentId: summaryAgentId,
+    inputText: buildVisionQuestionPrompt(questionText, imageRefs.length),
+    imageUrls: imageRefs,
+  });
+
+  return imageAnswer.trim() ? `<image_context>\n${imageAnswer.trim()}\n</image_context>` : "";
+}
+
+function collectImageRefsFromEntries(entries: Array<{ body: string }>): string[] {
+  const refs = new Set<string>();
+  for (const entry of entries) {
+    for (const ref of getImageUrlsFromMessageContent(entry.body)) {
+      const normalized = String(ref ?? "").trim();
+      if (normalized) refs.add(normalized);
+    }
+  }
+  return Array.from(refs).slice(0, 3);
+}
+
+function extractReplyAnchorText(...candidates: Array<string | undefined>): string {
+  for (const candidate of candidates) {
+    const trimmed = String(candidate ?? "").trim();
+    if (trimmed && trimmed !== "NO_REPLY") return trimmed.slice(0, 500);
+  }
+  return "";
+}
+
+function looksDirectedToBot(msg: OneBotMessage, selfId: number): boolean {
+  if (isMentioned(msg, selfId)) return true;
+  return getRawText(msg).includes("小爪");
+}
+
+function looksLikeImageQuestion(text: string): boolean {
+  const normalized = String(text ?? "").toLowerCase();
+  if (!normalized.trim()) return false;
+  return /(图片|照片|自拍|表情包|表情|图里|这张图|这图片|长啥|长得|帅|好看|颜值|哪个|谁更|谁最|可爱|看到|看得到|看见|像不像)/i.test(normalized);
 }
 
 function resolveNapCatRoute(params: {

@@ -44,12 +44,18 @@ export interface NapCatConfig {
   autoIntervenePrompt?: string;
   autoCheckIntervalMs?: number;
   autoCheckMessageThreshold?: number;
-  preCheckAgentId?: string;
-  preCheckModel?: string;
   requireMention?: boolean;
   historyLimit?: number;
   rateLimitMs?: number;
   renderMarkdownToPlain?: boolean;
+  multimodalImagesEnabled?: boolean;
+  multimodalImageMaxCount?: number;
+  persona?: {
+    enabled?: boolean;
+    coreAgentId?: string;
+    voiceAgentId?: string;
+    voiceOnGroupOnly?: boolean;
+  };
   whitelistUserIds?: number[];
   admins?: number[];
   disableCommandsForAgents?: string[];

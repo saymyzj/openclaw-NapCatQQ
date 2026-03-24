@@ -8,7 +8,15 @@
 
 import type { OneBotMessage, HistoryEntry } from "../types.js";
 import { getSenderName, getTextFromSegments, isMentioned } from "../message.js";
-import { insertGroupMessage, getRecentGroupMessages as getRecentGroupMessagesDb, getUnrepliedGroupMessages as getUnrepliedGroupMessagesDb, cleanupOldMessages } from "../db.js";
+import {
+  insertGroupMessage,
+  appendGroupMessageSummary,
+  getRecentGroupMessages as getRecentGroupMessagesDb,
+  getUnrepliedGroupMessages as getUnrepliedGroupMessagesDb,
+  getMessagesSinceLastReply as getMessagesSinceLastReplyDb,
+  getGroupReplyAnchor as getGroupReplyAnchorDb,
+  cleanupOldMessages,
+} from "../db.js";
 
 /** 定期巡检状态 */
 const groupCheckState = new Map<number, { lastCheckTime: number; messageCount: number }>();
@@ -21,14 +29,25 @@ const groupTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
 /** 定时巡检回调注册表 */
 const groupTimerCallbacks = new Map<number, () => void>();
+const groupActivityVersion = new Map<number, number>();
 
 /** 记录群聊消息到缓冲区 */
-export function recordGroupMessage(groupId: number | string, msg: OneBotMessage): void {
+export function recordGroupMessage(groupId: number | string, msg: OneBotMessage): number {
   const senderName = getSenderName(msg);
   const content = getTextFromSegments(msg) || String(msg.raw_message ?? "");
   const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
-  insertGroupMessage(numGroupId, senderName, content);
+  const rowId = insertGroupMessage(numGroupId, senderName, content);
   cleanupOldMessages(numGroupId);
+  groupActivityVersion.set(numGroupId, (groupActivityVersion.get(numGroupId) ?? 0) + 1);
+  return rowId;
+}
+
+export function attachGroupMessageImageSummary(messageId: number, summary: string): void {
+  appendGroupMessageSummary(messageId, summary);
+}
+
+export function getGroupActivityVersion(groupId: number): number {
+  return groupActivityVersion.get(groupId) ?? 0;
 }
 
 /** 获取群聊最近消息 */
@@ -55,6 +74,28 @@ export function getUnrepliedGroupMessages(groupId: number | string, limit = 50):
     timestamp: msg.timestamp,
     messageId: String(msg.id),
   }));
+}
+
+/** 获取群聊中自上次真实回复以来的消息 */
+export function getMessagesSinceLastReply(groupId: number | string, limit = 100): HistoryEntry[] {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  const messages = getMessagesSinceLastReplyDb(numGroupId, limit);
+  return messages.map(msg => ({
+    sender: String(msg.sender_name),
+    senderName: msg.sender_name,
+    body: msg.content,
+    timestamp: msg.timestamp,
+    messageId: String(msg.id),
+  }));
+}
+
+export function getGroupReplyAnchor(groupId: number | string): {
+  lastReplyTs: number;
+  lastBotReplyText: string;
+  lastBotReplyExcerpt: string;
+} | null {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  return getGroupReplyAnchorDb(numGroupId);
 }
 
 /** 清空群聊缓冲区 */
@@ -151,41 +192,4 @@ export function clearTimerCheck(groupId: number): void {
 export function isMonitoredGroup(groupId: number, monitorGroups: number[]): boolean {
   if (!monitorGroups || monitorGroups.length === 0) return false;
   return monitorGroups.includes(groupId);
-}
-
-/**
- * 构建定期巡检时发给 AI 的消息体
- */
-export function buildPeriodicCheckMessage(
-  groupId: number,
-  recentMessages: HistoryEntry[],
-  customPrompt?: string
-): string {
-  const lines = recentMessages.map((e) => {
-    const time = new Date(e.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-    return `[${e.senderName} ${time}]: ${e.body}`;
-  });
-
-  return `[群聊消息巡检 - 群${groupId}]\n` +
-    `以下是最近的群聊消息记录。请仅把它们当作“是否需要机器人介入”的判定材料，不要直接代入成群成员进行回复。\n` +
-    `请关注是否存在提问、求助、@机器人、需要纠错、需要信息补充，或者机器人明显能提供价值的切入点。\n` +
-    (customPrompt ? `\n额外判定指引：${customPrompt}\n` : "") +
-    `\n${lines.join("\n")}`;
-}
-
-/**
- * 构建 @机器人 时的上下文消息
- */
-export function buildMentionContextPrompt(
-  recentMessages: HistoryEntry[],
-  customPrompt?: string
-): string {
-  if (!recentMessages?.length) return customPrompt ?? "";
-
-  const contextBlock = recentMessages
-    .map((e) => `[${e.senderName}]: ${e.body}`)
-    .join("\n");
-
-  const base = customPrompt ?? "你是一个群聊AI助手，用户直接@了你，请回复他们的问题。回复要简洁有针对性。";
-  return `${base}\n\n以下是群聊最近的对话记录，请参考上下文进行回复：\n${contextBlock}`;
 }

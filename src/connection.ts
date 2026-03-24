@@ -14,6 +14,7 @@ const IMAGE_TEMP_DIR = join(tmpdir(), "openclaw-napcat");
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const IMAGE_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
 const IMAGE_TEMP_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const MEDIA_BASE64_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
 
 let ws: WebSocket | null = null;
 const pendingEcho = new Map<string, { resolve: (v: any) => void }>();
@@ -21,6 +22,8 @@ let echoCounter = 0;
 let connectionReadyResolve: (() => void) | null = null;
 const connectionReadyPromise = new Promise<void>((r) => { connectionReadyResolve = r; });
 let imageTempCleanupTimer: ReturnType<typeof setInterval> | null = null;
+const mediaBase64Cache = new Map<string, { value: string; expiresAt: number }>();
+const messageMediaCache = new Map<string, { values: string[]; expiresAt: number }>();
 
 function getLogger(): { info?: (s: string) => void; warn?: (s: string) => void; error?: (s: string) => void } {
   return (globalThis as any).__napCatApi?.logger ?? {};
@@ -67,6 +70,14 @@ function cleanupImageTemp(): void {
       } catch { /* ignore */ }
     }
   } catch { /* ignore */ }
+
+  const now = Date.now();
+  for (const [key, entry] of mediaBase64Cache.entries()) {
+    if (entry.expiresAt <= now) mediaBase64Cache.delete(key);
+  }
+  for (const [key, entry] of messageMediaCache.entries()) {
+    if (entry.expiresAt <= now) messageMediaCache.delete(key);
+  }
 }
 
 export async function resolveMediaToFile(media: string): Promise<string> {
@@ -102,6 +113,47 @@ export async function resolveMediaToBase64(media: string): Promise<string> {
   }
   const buf = readFileSync(trimmed.startsWith("file://") ? trimmed.slice(7) : trimmed);
   return `base64://${buf.toString("base64")}`;
+}
+
+export async function resolveMediaToBase64Cached(media: string): Promise<string> {
+  const trimmed = media?.trim();
+  if (!trimmed) throw new Error("Empty media");
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return resolveMediaToBase64(trimmed);
+  }
+
+  const cached = mediaBase64Cache.get(trimmed);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const value = await resolveMediaToBase64(trimmed);
+  mediaBase64Cache.set(trimmed, {
+    value,
+    expiresAt: Date.now() + MEDIA_BASE64_CACHE_MAX_AGE_MS,
+  });
+  return value;
+}
+
+export function rememberMessageMedia(messageId: string | number | undefined, values: string[]): void {
+  if (messageId == null) return;
+  const normalized = values.map((v) => String(v || "").trim()).filter(Boolean);
+  if (normalized.length === 0) return;
+  messageMediaCache.set(String(messageId), {
+    values: normalized,
+    expiresAt: Date.now() + MEDIA_BASE64_CACHE_MAX_AGE_MS,
+  });
+}
+
+export function getCachedMessageMedia(messageId: string | number | undefined): string[] {
+  if (messageId == null) return [];
+  const cached = messageMediaCache.get(String(messageId));
+  if (!cached) return [];
+  if (cached.expiresAt <= Date.now()) {
+    messageMediaCache.delete(String(messageId));
+    return [];
+  }
+  return [...cached.values];
 }
 
 export function startImageTempCleanup(): void {

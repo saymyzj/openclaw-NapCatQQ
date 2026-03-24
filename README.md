@@ -1,44 +1,104 @@
-# OpenClaw NapCat QQ Plugin
+# OpenClaw NapCat QQ 插件
 
-NapCat (OneBot v11) channel plugin for OpenClaw.
+NapCat（OneBot v11）的 OpenClaw QQ 频道插件。这个仓库现在的主目标，不再是“给 QQ 接一个能自动回话的 agent”，而是把 QQ 群聊接到一个持续存在、可被观察、可被约束、也可逐步自我演化的人格体运行时上。
 
-- GitHub: <https://github.com/saymyzj/openclaw-NapCatQQ>
-- Chinese README: [README.zh-CN.md](./README.zh-CN.md)
-- Contributing: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- GitHub：<https://github.com/saymyzj/openclaw-NapCatQQ>
+- English README: [README.en.md](./README.en.md)
+- 中文别名页：[README.zh-CN.md](./README.zh-CN.md)
+- 贡献说明：[CONTRIBUTING.md](./CONTRIBUTING.md)
 
-This project connects QQ private chats and group chats to OpenClaw, supports `@`-mention replies, buffered group monitoring with planner pre-check, native QQ media delivery, and a conservative security model suitable for public or semi-public chat surfaces.
+## 现在的项目颗粒度
 
-This repository is intended to be published as an MIT-licensed OpenClaw extension. The plugin integrates with OpenClaw's plugin/runtime interfaces, but your actual OpenClaw setup may differ. In particular, values such as agent IDs, workspace paths, model IDs, auth profiles, and session policy are user-specific and must be adjusted locally.
+当前实现已经收敛到下面这条主链：
 
-## Features
+- `persona-core`：唯一正式群聊主脑
+- `voice-organ`：表达器官，只负责润色，不新增事实
+- NapCat 插件：QQ 世界适配层，负责消息接入、session 路由、审批桥接、控制面拦截、真实消息落地
 
-- Private chat support with optional QQ user allowlist
-- Instant reply when the bot is `@`-mentioned in any group
-- Monitored-group buffering and periodic AI intervention checks
-- Dedicated planner pre-check flow via OpenClaw `/v1/chat/completions`
-- Native QQ delivery for text, images, videos, and files
-- Automatic extraction of `![](url)`, bare image URLs, and `<qqimg>/<qqvideo>/<qqfile>` tags from model replies
-- Markdown-to-plain-text conversion for QQ-friendly rendering
-- Buffered context stitching for monitored group replies
-- Route-aware agent selection through OpenClaw bindings
-- Optional background memory summarization that writes Markdown notes into `workspace-chat/memory`
-- Command blocking for selected agents on QQ surfaces, to prevent `/status`, `/model`, `/reset`, `!bash`, etc. from being used from chat
+已经移除的旧兼容方向：
 
-## Compatibility
+- `chat`
+- `chat-brain`
+- `chat-surface`
+- `planner`
+- 插件内的 precheck / dual-brain / 单脑群聊 fallback
 
-- OpenClaw: recent local gateway builds with plugin/channel runtime support
-- NapCatQQ: OneBot v11 forward WebSocket mode
-- Node.js: `>=22`
+也就是说，这个插件现在不再维护“多套群聊脑并存”的兼容逻辑，正式群聊回复主链只有一条：
 
-Because OpenClaw evolves quickly, you should verify any runtime-facing behavior against your installed OpenClaw version, especially:
+`NapCat inbound -> persona-core runtime run -> voice-organ -> QQ outbound`
 
-- plugin SDK signatures
-- routing/session behavior
-- tool policy names
-- command parsing behavior
-- `/v1/chat/completions` gateway semantics
+## 这个插件在做什么
 
-## Install
+它做的不是“帮 OpenClaw 发 QQ 消息”这么简单，而是把 QQ 群聊包装成一个对人格体友好的世界接口：
+
+- 任何群里 `@` 机器人，可以立即触发人格体正式回合
+- 白名单群会缓冲最近消息，并按时间或消息条数触发 periodic check
+- 插件自己维护 canonical ledger，保存“世界真相”
+- 人格连续性由稳定 `sessionKey` 维持
+- `exec` 审批通过 NapCat 私聊桥接到管理员
+- `/approve`、`/reflect` 属于控制平面，会被前置拦截，不进入普通聊天会话
+- QQ 图片、视频、文件都能原生发送
+- Markdown、图片 URL、`<qqimg>/<qqvideo>/<qqfile>` 之类输出会被自动整理成 QQ 可发送格式
+
+## 目前最重要的创新点
+
+### 1. runtime-first，而不是聊天接口拼装
+
+`persona-core` 和 `voice-organ` 走的是 OpenClaw runtime agent run，不是把 QQ 消息临时包一层再手写 `/v1/chat/completions` 主链。
+
+这意味着：
+
+- 工具调用会进入真实 agent session
+- `exec` 审批可以接上 OpenClaw 原生机制
+- 后续的 reflection、memory、followup 才有机会和同一人格连续体对齐
+
+### 2. canonical ledger + agent session 双层记忆
+
+插件侧保存的是“世界真相”：
+
+- 谁说了什么
+- 图片/媒体是什么
+- 最终实际发出去的话是什么
+- 群聊 engagement 状态是什么
+
+agent session 保存的是“人格内部连续性”：
+
+- 最近几轮自己怎么理解世界
+- 自己的工具调用历史
+- 自己的表达惯性
+
+这两层不会互相替代。
+
+### 3. 人格进化被当成正式系统目标，而不是 prompt 装饰
+
+当前已经具备的基础：
+
+- 每次正式群聊回复后，会把 `persona_draft -> voice_final` 样本写入 reflection sample
+- `/reflect` 可以手动触发 `persona-core` 的 reflection 模式
+- 审批、失败、异步补结果这些边界情况，都会影响人格体真实看到的历史和未来可吸收的表达样本
+
+接下来要做的，不是再叠更多“聊天模板”，而是让人格体能在控制边界内逐步更新自己的长期记忆与表达习惯。
+
+## 当前行为边界
+
+### 已支持
+
+- 群聊 `@` 触发人格体即时回复
+- 白名单群 periodic check
+- 群聊图片理解与图片摘要注入
+- `voice-organ` 默认改写，不再只是复读 `persona-core`
+- `exec` 审批通过 NapCat 私聊发给管理员
+- `/approve` 与 `/reflect` 控制面拦截
+- 审批等待时，不会再提前输出一版假的最终答案
+- 审批完成后的异步结果会尽量补走一次 `voice-organ`
+
+### 还没有完成
+
+- 自动 reflection 调度
+- 当日聊天记录自动沉淀到 persona memory
+- 更稳的 async followup 统一回到 `persona -> voice` 主链
+
+## 安装
 
 ```bash
 git clone https://github.com/saymyzj/openclaw-NapCatQQ ~/.openclaw/extensions/napcat-qq
@@ -47,42 +107,20 @@ npm install
 npm run build
 ```
 
-Then enable the plugin from your OpenClaw config and restart the gateway.
+然后在 `openclaw.json` 中启用插件，并重启 OpenClaw gateway。
 
-## What Is User-Specific
+## 推荐的 OpenClaw 配置形态
 
-Do not copy these values blindly from examples in this repository:
+现在推荐的本地布局只保留三类主体：
 
-- `agents.list[].id`
-- `agents.list[].workspace`
-- `agents.list[].agentDir`
-- `agents.list[].model`
-- `auth.profiles.*`
-- `bindings[*].agentId`
-- `bindings[*].match.peer.id`
-- `channels.napcat.preCheckAgentId`
-- `channels.napcat.disableCommandsForAgents`
-- gateway token, WebSocket token, QQ numbers, group numbers
+- `main`
+  用于可信私聊、控制面、人工维护
+- `persona-core`
+  用于正式群聊人格回合与 reflection
+- `voice-organ`
+  用于群聊表达润色
 
-Examples in this README use placeholders such as `chat`, `main`, and `planner`, but your own OpenClaw instance may use different names entirely.
-
-## Recommended OpenClaw Layout
-
-This plugin works best when you separate responsibilities across agents:
-
-- `main`: trusted direct-chat or high-privilege workspace
-- `chat`: low-risk QQ-facing conversational workspace
-- `planner`: ultra-minimal decision agent used only for pre-checking whether the bot should speak
-
-A recommended security posture is:
-
-- `planner`: no tools, no chat commands, tiny workspace, no memory/persona baggage
-- `chat`: read/search-only tools, no write/edit/exec, no chat commands
-- `main`: reserved for trusted/private routes only
-
-## Example OpenClaw Config
-
-This is an example, not a drop-in file.
+一个简化后的示意配置：
 
 ```jsonc
 {
@@ -90,26 +128,30 @@ This is an example, not a drop-in file.
     "list": [
       {
         "id": "main",
+        "default": true,
         "workspace": "/path/to/workspace",
         "agentDir": "/path/to/agents/main/agent",
         "model": "openai-codex/gpt-5.4"
       },
       {
-        "id": "chat",
-        "default": true,
-        "workspace": "/path/to/workspace-chat",
-        "agentDir": "/path/to/agents/chat/agent",
+        "id": "persona-core",
+        "workspace": "/path/to/workspace-persona-core",
+        "agentDir": "/path/to/agents/persona-core/agent",
         "model": "openai-codex/gpt-5.4",
         "tools": {
-          "allow": ["read", "web-search", "web-fetch", "memory-search", "memory-get"],
-          "deny": ["exec", "write", "edit", "apply_patch"]
+          "allow": ["read", "write", "edit", "apply_patch", "exec", "web_fetch", "memory_search", "memory_get"],
+          "exec": {
+            "host": "gateway",
+            "security": "allowlist",
+            "ask": "on-miss"
+          }
         }
       },
       {
-        "id": "planner",
-        "workspace": "/path/to/workspace-planner",
-        "agentDir": "/path/to/agents/planner/agent",
-        "model": "openai-codex/gpt-5.4",
+        "id": "voice-organ",
+        "workspace": "/path/to/workspace-voice-organ",
+        "agentDir": "/path/to/agents/voice-organ/agent",
+        "model": "openrouter/bytedance-seed/seed-2.0-mini",
         "tools": {
           "allow": [],
           "deny": [
@@ -118,10 +160,10 @@ This is an example, not a drop-in file.
             "write",
             "edit",
             "apply_patch",
-            "web-search",
-            "web-fetch",
-            "memory-search",
-            "memory-get",
+            "web_search",
+            "web_fetch",
+            "memory_search",
+            "memory_get",
             "group:runtime",
             "group:fs",
             "group:ui",
@@ -147,256 +189,98 @@ This is an example, not a drop-in file.
       }
     }
   ],
+  "approvals": {
+    "exec": {
+      "enabled": true,
+      "mode": "targets",
+      "agentFilter": ["persona-core"],
+      "targets": [
+        {
+          "channel": "napcat",
+          "to": "napcat:1234567890"
+        }
+      ]
+    }
+  },
   "channels": {
     "napcat": {
       "host": "127.0.0.1",
       "port": 3001,
       "accessToken": "<napcat_access_token>",
-      "path": "/",
       "monitorGroups": [123456789],
       "autoIntervene": true,
       "autoCheckIntervalMs": 30000,
       "autoCheckMessageThreshold": 10,
-      "preCheckAgentId": "planner",
-      "disableCommandsForAgents": ["chat", "planner"],
       "whitelistUserIds": ["1234567890"],
       "admins": ["1234567890"],
       "historyLimit": 100,
       "rateLimitMs": 1000,
-      "renderMarkdownToPlain": true
-    }
-  },
-  "plugins": {
-    "load": {
-      "paths": ["~/.openclaw/extensions/napcat-qq"]
-    },
-    "entries": {
-      "openclaw-napcat": {
-        "enabled": true
-      }
+      "renderMarkdownToPlain": true,
+      "multimodalImagesEnabled": true,
+      "multimodalImageMaxCount": 3,
+      "persona": {
+        "enabled": true,
+        "coreAgentId": "persona-core",
+        "voiceAgentId": "voice-organ",
+        "voiceOnGroupOnly": true
+      },
+      "disableCommandsForAgents": ["persona-core", "voice-organ"]
     }
   }
 }
 ```
 
-## NapCat Config
+## 人格进化相关说明
 
-In NapCat WebUI, configure a forward WebSocket server:
+这个插件里，“人格进化”现在不是抽象概念，而是一个明确的工程分层：
 
-- host: usually `0.0.0.0`
-- port: for example `3001`
-- path: `/`
-- message format: `array` recommended
-- access token: optional, but recommended when the gateway is not fully local
+- 聊天正式回合：
+  `persona-core` 决定要不要说、说什么核心意思
+- 表达器官：
+  `voice-organ` 把核心意思改写成更自然的群友语气
+- 样本沉淀：
+  插件把 `persona_draft / voice_final / context_excerpt` 写成 reflection sample
+- 手动反思：
+  管理员私聊 `/reflect`
+- 下一步：
+  heartbeat / cron 自动消费 pending reflection samples
+- 再下一步：
+  保存当日聊天记录，沉淀 daily memory，再由 reflection 决定哪些内容上升为长期记忆
 
-Then point `channels.napcat.host/port/path/accessToken` to that endpoint.
+## 为什么不再保留旧兼容链路
 
-## Channel Config
+因为“多套脑并行 + 旧 fallback 长期共存”会带来三个问题：
 
-The plugin reads `channels.napcat` from `openclaw.json`.
+- 人格体并不真的拥有会话连续性
+- 审批、工具、私聊回传会变得不可靠
+- 后续做 reflection 和 memory 时，历史会混进不属于人格体自己的输出
 
-### Supported Fields
+所以这个仓库现在明确选择：
 
-| Field | Type | Default | Notes |
-|---|---|---:|---|
-| `host` | `string` | `127.0.0.1` | NapCat WebSocket host |
-| `port` | `number` | `3001` | NapCat WebSocket port |
-| `accessToken` | `string` | - | NapCat access token |
-| `path` | `string` | `/` | WebSocket path |
-| `monitorGroups` | `number[]` | `[]` | Groups eligible for buffered periodic checks |
-| `autoIntervene` | `boolean` | `true` | Enable monitored-group periodic checks |
-| `autoIntervenePrompt` | `string` | - | Extra planner guidance |
-| `autoCheckIntervalMs` | `number` | `30000` | Timer-based patrol interval |
-| `autoCheckMessageThreshold` | `number` | `10` | Buffered-message threshold |
-| `preCheckAgentId` | `string` | `planner` | OpenClaw agent used for pre-check |
-| `preCheckModel` | `string` | - | Optional override still used by background summarizer; pre-check routing is better controlled via `preCheckAgentId` |
-| `requireMention` | `boolean` | `false` | Mention gating helper for some reply flows |
-| `historyLimit` | `number` | `20` | Pending in-memory history window |
-| `rateLimitMs` | `number` | `1000` | Delay between sends |
-| `renderMarkdownToPlain` | `boolean` | `true` | Convert Markdown before sending |
-| `whitelistUserIds` | `Array<string|number>` | `[]` | Private-chat allowlist |
-| `admins` | `Array<string|number>` | `[]` | Reserved admin IDs for local policy logic |
-| `disableCommandsForAgents` | `string[]` | `["chat","planner"]` | Block `/...` and `!...` for selected routed agents |
+- 删掉旧群聊兼容链路
+- 只维护 persona 主链
+- 把精力留给自动 reflection、daily memory、async followup 收敛
 
-### Environment Variables
+## 参考与感谢
 
-Only connection basics can be sourced from environment variables:
+这个仓库直接受益于以下项目与规范：
 
-```bash
-export NAPCAT_WS_HOST=127.0.0.1
-export NAPCAT_WS_PORT=3001
-export NAPCAT_WS_ACCESS_TOKEN=your_token
-export NAPCAT_WS_PATH=/
-```
+- [openclaw/openclaw](https://github.com/openclaw/openclaw)
+  感谢 OpenClaw 提供 agent runtime、tooling、session、approval 与插件运行时。
+- [NapNeko/NapCatQQ](https://github.com/NapNeko/NapCatQQ)
+  感谢 NapCat 提供 QQ 到 OneBot v11 的稳定桥接能力。
+- [botuniverse/onebot-v11](https://github.com/botuniverse/onebot-v11)
+  感谢 OneBot v11 规范提供统一的动作/事件模型，让 QQ 适配层可以更清晰地工程化。
 
-Behavioral settings such as monitored groups, planner agent, and command blocking still belong in OpenClaw config.
+如果没有这些上游工作，这个插件不会长成现在这个样子。谢谢。
 
-## Message Flow
+## 接下来的任务
 
-### Group Message
+- 自动 reflection：从手动 `/reflect` 走向 heartbeat + cron 调度
+- daily memory：存储当日聊天记录，供人格体进行日级回顾
+- async followup 收敛：让审批后、异步查完后的结果也稳定回到 `persona -> voice` 主链
+- 更稳定的 persona 文件维护边界：避免 reflection 修改超出人格工作区的内容
 
-1. Receive a group message
-2. Record it into the local message buffer database
-3. If the bot is mentioned, dispatch immediately
-4. Otherwise, if the group is monitored, buffer and wait for:
-   - message threshold reached, or
-   - timer-triggered periodic check
-5. Send the buffered slice to the planner agent
-6. If planner says `reply`, dispatch buffered context to the routed chat agent
-7. If planner says `silence`, keep quiet and only advance the checkpoint for the processed slice
+## 许可证
 
-### Private Message
-
-1. Receive a private message
-2. Apply `whitelistUserIds` if configured
-3. Resolve target agent via OpenClaw routing/bindings
-4. Optionally block command-style input for protected agents
-5. Dispatch to OpenClaw
-
-## Routing Notes
-
-This plugin uses OpenClaw route resolution, and private/group traffic may land in different agents depending on:
-
-- default agent
-- `bindings`
-- `session.dmScope`
-- peer match shape such as `user:<qq>` or `group:<groupId>`
-- existing session routing metadata
-
-If you use bindings, verify them against your own OpenClaw version and your chosen peer format.
-
-Example direct-message binding:
-
-```jsonc
-{
-  "bindings": [
-    {
-      "agentId": "main",
-      "match": {
-        "channel": "napcat",
-        "peer": {
-          "kind": "direct",
-          "id": "user:1234567890"
-        }
-      }
-    }
-  ]
-}
-```
-
-## Planner Sessions
-
-The planner pre-check uses OpenClaw gateway `POST /v1/chat/completions`.
-
-Important:
-
-- this is stateless-per-request, not no-session-at-all
-- OpenClaw may still create one-shot session files for planner requests
-- those session files are expected under the planner agent's session store
-
-If you want low cost and easy cleanup:
-
-- keep planner in its own agent
-- give it a minimal workspace
-- clean only the planner session store
-
-## Command Blocking
-
-For QQ-facing agents such as `chat` and `planner`, this plugin can block OpenClaw command-style messages before they enter the normal command pipeline.
-
-Blocked examples:
-
-- `/status`
-- `/model`
-- `/reset`
-- `/new`
-- `!bash ls`
-
-This is controlled by `channels.napcat.disableCommandsForAgents`.
-
-## Media Handling
-
-The plugin supports:
-
-- plain text
-- native QQ image sends
-- native QQ video sends
-- native QQ file uploads
-
-Model replies can include:
-
-- Markdown images: `![](https://example.com/a.png)`
-- bare image URLs
-- `<qqimg>...</qqimg>`
-- `<qqvideo>...</qqvideo>`
-- `<qqfile>...</qqfile>`
-
-The plugin extracts these payloads and sends them through NapCat's QQ-native media APIs.
-
-## Memory Summarization
-
-The plugin includes a background summarizer that periodically:
-
-- reads unsummarized buffered group messages
-- calls the OpenClaw gateway
-- appends a short summary into `workspace-chat/memory/<date>.md`
-
-This write path is performed by the plugin process itself, not by granting the `chat` agent file-write tools.
-
-That means you can keep the `chat` agent read-only while still preserving group-summary notes.
-
-## Security Recommendations
-
-- Do not expose a high-privilege coding agent directly to public group chats
-- Keep `planner` tool-less
-- Keep `chat` read/search-only unless you fully trust the surface
-- Disable QQ-side command access for public-facing agents
-- Avoid reusing your primary workspace for monitored groups
-- Do not publish your real tokens, QQ numbers, absolute home paths, or auth profile names
-
-## Development
-
-```bash
-npm install
-npm run build
-npm run dev
-```
-
-CI is configured via GitHub Actions in [ci.yml](./.github/workflows/ci.yml).
-
-## Project Structure
-
-```text
-extensions/napcat-qq/
-├── src/
-│   ├── index.ts
-│   ├── channel.ts
-│   ├── service.ts
-│   ├── connection.ts
-│   ├── send.ts
-│   ├── config.ts
-│   ├── types.ts
-│   ├── message.ts
-│   ├── markdown.ts
-│   ├── precheck.ts
-│   ├── memory-job.ts
-│   ├── sdk.ts
-│   ├── reply-context.ts
-│   └── handlers/
-│       ├── process-inbound.ts
-│       └── auto-intervene.ts
-├── skills/
-│   └── napcat-ops/
-│       └── SKILL.md
-├── openclaw.plugin.json
-├── package.json
-└── README.md
-```
-
-## MIT License
-
-This project is released under the MIT License. See [LICENSE](./LICENSE).
-
-## OpenClaw Attribution
-
-This plugin depends on OpenClaw runtime APIs and is designed for OpenClaw deployments. OpenClaw itself is a separate upstream project with its own release cycle, documentation, and compatibility expectations.
+MIT

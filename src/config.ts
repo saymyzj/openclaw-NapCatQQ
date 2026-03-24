@@ -27,17 +27,25 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
       autoIntervenePrompt: channel.autoIntervenePrompt,
       autoCheckIntervalMs: channel.autoCheckIntervalMs ?? 30000,
       autoCheckMessageThreshold: channel.autoCheckMessageThreshold ?? 10,
-      preCheckAgentId: channel.preCheckAgentId ?? "planner",
-      preCheckModel: channel.preCheckModel,
       requireMention: channel.requireMention ?? false,
       historyLimit: channel.historyLimit ?? 20,
       rateLimitMs: channel.rateLimitMs ?? 1000,
       renderMarkdownToPlain: channel.renderMarkdownToPlain ?? true,
+      multimodalImagesEnabled: channel.multimodalImagesEnabled !== false,
+      multimodalImageMaxCount: Math.max(1, Number(channel.multimodalImageMaxCount ?? 3)),
+      persona: channel.persona
+        ? {
+            enabled: channel.persona.enabled !== false,
+            coreAgentId: channel.persona.coreAgentId ?? "persona-core",
+            voiceAgentId: channel.persona.voiceAgentId ?? "voice-organ",
+            voiceOnGroupOnly: channel.persona.voiceOnGroupOnly !== false,
+          }
+        : undefined,
       whitelistUserIds: channel.whitelistUserIds ?? [],
       admins: channel.admins ?? [],
       disableCommandsForAgents: Array.isArray(channel.disableCommandsForAgents)
         ? channel.disableCommandsForAgents.filter((x: unknown) => typeof x === "string" && x.trim().length > 0)
-        : ["chat", "planner"],
+        : ["persona-core", "voice-organ"],
     };
   }
 
