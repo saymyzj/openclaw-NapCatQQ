@@ -183,8 +183,7 @@
         "items": { "type": "string" },
         "description": "在 QQ 会话里禁用命令式输入的 agent 列表，推荐至少包含 persona-core 和 voice-organ"
       }
-    },
-    "required": ["host", "port"]
+    }
   },
   "uiHints": {
     "host": {

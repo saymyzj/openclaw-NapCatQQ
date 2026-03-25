@@ -64,7 +64,6 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_reflection_samples_group_created ON reflection_samples(group_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_reflection_samples_pending ON reflection_samples(reflected_at, created_at);
-  CREATE INDEX IF NOT EXISTS idx_reflection_samples_lease ON reflection_samples(reflected_at, lease_expires_at, created_at);
 `);
 
 db.exec(`
@@ -142,6 +141,10 @@ if (!reflectionSampleColumnNames.has("last_error")) {
 if (!reflectionSampleColumnNames.has("trigger_source")) {
   db.exec(`ALTER TABLE reflection_samples ADD COLUMN trigger_source TEXT NOT NULL DEFAULT ''`);
 }
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_reflection_samples_lease
+  ON reflection_samples(reflected_at, lease_expires_at, created_at);
+`);
 
 const dailyMemoryColumns = db.prepare(`PRAGMA table_info(daily_memory_state)`).all() as Array<{ name: string }>;
 const dailyMemoryColumnNames = new Set(dailyMemoryColumns.map((col) => col.name));
