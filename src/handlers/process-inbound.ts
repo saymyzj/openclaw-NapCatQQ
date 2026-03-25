@@ -11,9 +11,6 @@
  *   - 否则处理所有私聊
  */
 
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-
 import type { OneBotMessage } from "../types.js";
 import { getNapCatConfig, getRenderMarkdownToPlain, getWhitelistUserIds } from "../config.js";
 import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageContent, getImageUrls, getImageUrlsFromMessageContent, isMentioned, getSenderName } from "../message.js";
@@ -28,12 +25,12 @@ import {
   updateGroupReplyCheckpoint,
   updateGroupReplyAnchor,
   insertReflectionSample,
-  getPendingReflectionSamples,
-  markReflectionSamplesReflected,
 } from "../db.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
 import { normalizePersonaTurn, normalizeVoiceText, type PersonaTurn } from "../persona.js";
 import { registerPendingApprovalSurface } from "../pending-approval.js";
+import { runReflectionBatch } from "../reflection-runner.js";
+import { runAgentTextViaRuntime } from "../runtime-agent.js";
 import {
   recordGroupMessage,
   attachGroupMessageImageSummary,
@@ -51,13 +48,6 @@ import { answerImagesWithResponses, summarizeImagesWithResponses } from "../resp
 
 const DEFAULT_HISTORY_LIMIT = 20;
 export const sessionHistories = new Map<string, Array<{ sender: string; body: string; timestamp: number; messageId: string }>>();
-
-type RuntimeAgentRunResult = {
-  finalText: string;
-  status: "completed" | "approval-pending" | "approval-unavailable";
-  approvalMessage: string;
-  queuedFinal: boolean;
-};
 
 export async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void> {
   await loadPluginSdk();
@@ -696,7 +686,10 @@ async function dispatchToAIPersona(
       registerPendingApprovalSurface(`group:${groupId}`, {
         groupId,
         chatContextExcerpt: extractTaggedBlock(chatContext, "chat_context"),
+        personaAgentId: coreAgentId,
         voiceAgentId,
+        personaSessionKey,
+        voiceSessionKey: `agent:${voiceAgentId}:surface:group:${groupId}`,
         gatewayPort: cfg?.gateway?.port ?? 18789,
         gatewayToken: cfg?.gateway?.auth?.token ?? "",
       });
@@ -1401,72 +1394,26 @@ async function dispatchPersonaReflectionCommand(api: any, params: {
   const match = commandText.match(/^\/reflect(?:\s+(\d+))?(?:\s+(\d+))?$/i);
   const requestedGroupId = match?.[1] ? Number(match[1]) : undefined;
   const requestedLimit = match?.[2] ? Math.max(1, Math.min(20, Number(match[2]))) : 5;
-  const samples = getPendingReflectionSamples(requestedLimit, requestedGroupId);
   const userId = Number(msg.user_id);
 
-  if (samples.length === 0) {
-    await sendPrivateMsg(userId, "没有待反思样本。");
-    return;
-  }
-
-  const personaAgentId = napCatCfg?.persona?.coreAgentId ?? "persona-core";
-  const reflectionSessionKey = requestedGroupId != null
-    ? `agent:${personaAgentId}:reflection:group:${requestedGroupId}`
-    : `agent:${personaAgentId}:reflection:global`;
-  api.logger?.info?.(
-    `[napcat] ▶ reflection command session=${reflectionSessionKey} samples=${samples.length} ` +
-    `requestedGroup=${requestedGroupId ?? "global"} replyTarget=napcat:${userId}`,
-  );
-  const packets = samples.map((sample, index) => [
-    `<sample_${index + 1}>`,
-    `group_id: ${sample.group_id}`,
-    `created_at: ${new Date(sample.created_at).toLocaleString("zh-CN")}`,
-    `context_excerpt:`,
-    sample.context_excerpt,
-    `persona_draft: ${sample.persona_draft}`,
-    `voice_final: ${sample.voice_final}`,
-    `edit_distance_summary: ${buildEditDistanceSummary(sample.persona_draft, sample.voice_final)}`,
-    `</sample_${index + 1}>`,
-  ].join("\n")).join("\n\n");
-
-  const inputText = [
-    "<operating_mode>reflection</operating_mode>",
-    "",
-    "<reflection_packets>",
-    packets,
-    "</reflection_packets>",
-    "",
-    "<memory_candidates>",
-    samples
-      .map((sample) => `group ${sample.group_id}: ${sample.voice_final}`)
-      .join("\n"),
-    "</memory_candidates>",
-    "",
-    "<task>",
-    "请回顾这些样本，判断哪些表达变化值得吸收。必要时更新当前工作区中的记忆或人格文件，然后用简短中文总结你这次做了什么。",
-    "</task>",
-  ].join("\n");
-
   try {
-    const summaryResult = await runAgentTextViaRuntime(api, {
+    const result = await runReflectionBatch(api, {
       runtime,
       cfg,
-      agentId: personaAgentId,
-      sessionKey: reflectionSessionKey,
-      inputText,
+      napCatCfg,
+      limit: requestedLimit,
+      groupId: requestedGroupId,
       userId,
-      groupId: undefined,
-      isGroup: false,
       senderName: getSenderName(msg),
       replyTarget: `napcat:${userId}`,
+      triggerSource: "manual",
     });
-    const summary = summaryResult.finalText;
-
-    markReflectionSamplesReflected(samples.map((sample) => sample.id));
-    api.logger?.info?.(
-      `[napcat] ▶ reflection private send success user=${userId} chars=${(summary || "").length}`,
-    );
-    await sendPrivateMsg(userId, summary || `已完成 reflection，共处理 ${samples.length} 条样本。`);
+    if (result.processedCount === 0) {
+      await sendPrivateMsg(userId, "没有待反思样本。");
+      return;
+    }
+    api.logger?.info?.(`[napcat] ▶ reflection private send success user=${userId} chars=${result.summary.length}`);
+    await sendPrivateMsg(userId, result.summary);
   } catch (err: any) {
     api.logger?.error?.(`[napcat] reflection command failed: ${err?.message}`);
     api.logger?.info?.(
@@ -1477,139 +1424,6 @@ async function dispatchPersonaReflectionCommand(api: any, params: {
       `本次 reflection 失败：${err?.message?.slice(0, 120) || "未知错误"}`,
     );
   }
-}
-
-async function runAgentTextViaRuntime(
-  api: any,
-  params: {
-    runtime: any;
-    cfg: any;
-    agentId: string;
-    sessionKey: string;
-    inputText: string;
-    userId: number;
-    groupId: number | undefined;
-    isGroup: boolean;
-    senderName: string;
-    replyTarget: string;
-  },
-): Promise<RuntimeAgentRunResult> {
-  const { runtime, cfg, agentId, sessionKey, inputText, userId, groupId, isGroup, senderName, replyTarget } = params;
-  const accountId = "default";
-  const chatType = isGroup ? "group" : "direct";
-  const dispatchStartedAt = Date.now();
-  const storePath = runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
-    agentId,
-  }) ?? "";
-  const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
-  const formattedBody =
-    runtime.channel.reply?.formatInboundEnvelope?.({
-      channel: "NapCat",
-      from: senderName,
-      timestamp: Date.now(),
-      body: inputText,
-      chatType,
-      sender: { name: senderName, id: String(userId) },
-      envelope: envelopeOptions,
-    }) ?? { content: [{ type: "text", text: inputText }] };
-
-  const ctxPayload = {
-    Body: formattedBody,
-    BodyForAgent: inputText,
-    BodyForCommands: inputText,
-    RawBody: inputText,
-    CommandBody: inputText,
-    From: replyTarget,
-    To: replyTarget,
-    SessionKey: sessionKey,
-    AccountId: accountId,
-    ChatType: chatType,
-    ConversationLabel: replyTarget,
-    SenderName: senderName,
-    SenderId: String(userId),
-    Provider: "napcat",
-    Surface: "napcat",
-    MessageSid: `napcat-runtime-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    Timestamp: Date.now(),
-    OriginatingChannel: "napcat",
-    OriginatingTo: replyTarget,
-    CommandAuthorized: false,
-    DeliveryContext: {
-      channel: "napcat",
-      to: replyTarget,
-      accountId,
-    },
-    _napcat: { userId, groupId, isGroup, senderName },
-  };
-
-  api.logger?.info?.(
-    `[napcat] ▶ runtime dispatch agent=${agentId} sessionKey=${sessionKey} replyTarget=${replyTarget} ` +
-    `storePath=${storePath || "(empty)"} origin=${ctxPayload.OriginatingChannel}:${ctxPayload.OriginatingTo} ` +
-    `delivery=${formatDeliveryContextForLog(ctxPayload.DeliveryContext)} chatType=${chatType}`,
-  );
-
-  if (runtime.channel.session?.recordInboundSession) {
-    await runtime.channel.session.recordInboundSession({
-      storePath,
-      sessionKey,
-      ctx: ctxPayload,
-      updateLastRoute: {
-        sessionKey,
-        channel: "napcat",
-        to: replyTarget,
-        accountId,
-      },
-      onRecordError: (err: any) => api.logger?.warn?.(`[napcat] runtime recordInboundSession(${agentId}): ${err}`),
-    });
-    api.logger?.info?.(
-      `[napcat] ▶ runtime session recorded agent=${agentId} sessionKey=${sessionKey} ` +
-      `updateLastRoute=napcat:${replyTarget} account=${accountId}`,
-    );
-  }
-
-  if (runtime.channel.activity?.record) {
-    runtime.channel.activity.record({ channel: "napcat", accountId, direction: "inbound" });
-  }
-
-  let finalText = "";
-  let deliverError: Error | null = null;
-  const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg,
-    dispatcherOptions: {
-      deliver: async (payload: unknown, info: { kind: string }) => {
-        if (info.kind !== "final") return;
-        finalText = extractReplyAnchorText(
-          typeof payload === "string" ? payload : (payload as any)?.text,
-          typeof payload === "string" ? "" : (payload as any)?.body,
-        );
-      },
-      onError: async (err: any) => {
-        deliverError = err instanceof Error ? err : new Error(String(err));
-      },
-    },
-  });
-
-  if (deliverError) throw deliverError;
-  if (!result?.queuedFinal) {
-    throw new Error(`runtime agent ${agentId} produced no final reply`);
-  }
-  const approvalState = await detectApprovalStateFromSession({
-    storePath,
-    sessionKey,
-    startedAtMs: dispatchStartedAt,
-  });
-  api.logger?.info?.(
-    `[napcat] ▶ runtime dispatch settled agent=${agentId} sessionKey=${sessionKey} ` +
-    `queuedFinal=${String(Boolean(result?.queuedFinal))} finalChars=${finalText.trim().length} ` +
-    `status=${approvalState.status}`,
-  );
-  return {
-    finalText: finalText.trim(),
-    status: approvalState.status,
-    approvalMessage: approvalState.message,
-    queuedFinal: Boolean(result?.queuedFinal),
-  };
 }
 
 function formatDeliveryContextForLog(deliveryContext: unknown): string {
@@ -1628,82 +1442,6 @@ function buildPersonaPendingReply(status: "approval-pending" | "approval-unavail
   return "我先去申请一下查询权限，批完再继续给你补结果。";
 }
 
-async function detectApprovalStateFromSession(params: {
-  storePath: string;
-  sessionKey: string;
-  startedAtMs: number;
-}): Promise<{ status: RuntimeAgentRunResult["status"]; message: string }> {
-  if (!params.storePath) {
-    return { status: "completed", message: "" };
-  }
-
-  try {
-    const storeRaw = await readFile(params.storePath, "utf8");
-    const store = JSON.parse(storeRaw) as Record<string, { sessionId?: string; sessionFile?: string }>;
-    const entry = store[params.sessionKey];
-    if (!entry?.sessionId && !entry?.sessionFile) {
-      return { status: "completed", message: "" };
-    }
-
-    const sessionFile = entry.sessionFile
-      ? String(entry.sessionFile)
-      : path.join(path.dirname(params.storePath), `${String(entry.sessionId)}.jsonl`);
-    const sessionRaw = await readFile(sessionFile, "utf8");
-    const lines = sessionRaw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(-40);
-
-    let latestStatus: "approval-pending" | "approval-unavailable" | null = null;
-    let latestMessage = "";
-
-    for (const line of lines) {
-      let parsed: any;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-
-      const timestampMs = Date.parse(String(parsed?.timestamp ?? ""));
-      if (Number.isFinite(timestampMs) && timestampMs < params.startedAtMs - 2000) {
-        continue;
-      }
-
-      if (parsed?.type !== "message") continue;
-      if (parsed?.message?.role !== "toolResult") continue;
-      const details = parsed?.message?.details;
-      if (!details || typeof details !== "object") continue;
-      if (details.status !== "approval-pending" && details.status !== "approval-unavailable") continue;
-
-      latestStatus = details.status;
-      latestMessage = String(
-        parsed?.message?.content?.[0]?.text ??
-        details.warningText ??
-        "",
-      ).trim();
-    }
-
-    return latestStatus
-      ? { status: latestStatus, message: latestMessage }
-      : { status: "completed", message: "" };
-  } catch {
-    return { status: "completed", message: "" };
-  }
-}
-
-function buildEditDistanceSummary(before: string, after: string): string {
-  const a = String(before ?? "").trim();
-  const b = String(after ?? "").trim();
-  if (!a && !b) return "both empty";
-  if (!a) return "persona draft empty, final text added";
-  if (!b) return "final text empty";
-  if (a === b) return "unchanged";
-  if (b.length < a.length) return "final text is shorter and tighter";
-  if (b.length > a.length) return "final text is more expanded or reshaped";
-  return "wording changed with similar length";
-}
 
 function shouldUseMultimodalImages(napCatCfg: any, imageUrls: string[]): boolean {
   return napCatCfg.multimodalImagesEnabled !== false && imageUrls.length > 0;

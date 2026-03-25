@@ -13,6 +13,7 @@ import {
   startImageTempCleanup,
   stopImageTempCleanup,
 } from "./connection.js";
+import { createMaintenanceLoop } from "./maintenance.js";
 import { processInboundMessage } from "./handlers/process-inbound.js";
 
 const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000, 60000];
@@ -21,6 +22,7 @@ export function registerService(api: any): void {
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let stopping = false;
+  const maintenanceLoop = createMaintenanceLoop(api);
 
   function scheduleReconnect() {
     if (stopping) return;
@@ -46,6 +48,7 @@ export function registerService(api: any): void {
       reconnectAttempt = 0;
       api.logger?.info?.("[napcat] WebSocket connected");
       startImageTempCleanup();
+      maintenanceLoop.start();
 
       ws.on("message", (data: Buffer) => {
         try {
@@ -72,6 +75,7 @@ export function registerService(api: any): void {
       ws.on("close", (code: number, reason: Buffer) => {
         api.logger?.info?.(`[napcat] WebSocket closed (code=${code})`);
         setWs(null);
+        maintenanceLoop.stop();
         if (!stopping) scheduleReconnect();
       });
 
@@ -93,6 +97,7 @@ export function registerService(api: any): void {
     stop: async () => {
       stopping = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      maintenanceLoop.stop();
       stopImageTempCleanup();
       stopConnection();
       api.logger?.info?.("[napcat] service stopped");

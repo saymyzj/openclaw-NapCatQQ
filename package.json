@@ -1,7 +1,7 @@
 {
   "name": "openclaw-napcat",
-  "version": "1.0.0",
-  "description": "NapCat (OneBot v11) channel plugin for OpenClaw — QQ group monitoring with auto-intervention",
+  "version": "2.0.0",
+  "description": "OpenClaw 的 NapCat QQ 插件 / OpenClaw NapCat QQ plugin，独立人格主链、审批桥接、reflection 与 daily memory。",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,7 +19,7 @@
       "label": "NapCat",
       "selectionLabel": "NapCat (QQ OneBot v11)",
       "docsPath": "/channels/napcat",
-      "blurb": "NapCat OneBot v11 via WebSocket — QQ group monitoring with auto-intervention",
+      "blurb": "OpenClaw 的 NapCat QQ 插件 / OpenClaw NapCat QQ plugin，独立人格主链、审批桥接、reflection 与 daily memory。",
       "order": 80,
       "aliases": ["qq", "napcat", "onebot"]
     }

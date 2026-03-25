@@ -1,126 +1,171 @@
 # OpenClaw NapCat QQ 插件
 
-NapCat（OneBot v11）的 OpenClaw QQ 频道插件。这个仓库现在的主目标，不再是“给 QQ 接一个能自动回话的 agent”，而是把 QQ 群聊接到一个持续存在、可被观察、可被约束、也可逐步自我演化的人格体运行时上。
+NapCat（OneBot v11）到 OpenClaw 的 QQ 频道插件。
+
+它的目标不是“给 QQ 接一个普通聊天机器人”，而是把 QQ 群聊接入一条稳定的、可审批、可反思、可沉淀记忆的 runtime 主链，让 `persona-core` 作为独立人格长期运行，`voice-organ` 作为唯一表达器官负责自然化输出。
 
 - GitHub：<https://github.com/saymyzj/openclaw-NapCatQQ>
 - English README: [README.en.md](./README.en.md)
-- 中文别名页：[README.zh-CN.md](./README.zh-CN.md)
+- 中文入口别名：[README.zh-CN.md](./README.zh-CN.md)
 - 贡献说明：[CONTRIBUTING.md](./CONTRIBUTING.md)
 
-## 现在的项目颗粒度
+## 亮点
 
-当前实现已经收敛到下面这条主链：
+- 独立人格：QQ群聊主脑不是一次性 prompt，而是长期存在的 `persona-core`
+- runtime-first：正式主链走 OpenClaw runtime，不把 QQ 主链退回到临时 `/v1/chat/completions`
+- 双层表达：`persona-core` 决定“说什么”，`voice-organ` 决定“怎么说”
+- 审批闭环：高风险 `exec` 会走 OpenClaw 原生审批，再通过 NapCat 回到管理员私聊
+- 记忆闭环：插件维护 world ledger，reflection 和 daily memory 交给人格体自己吸收
 
-- `persona-core`：唯一正式群聊主脑
-- `voice-organ`：表达器官，只负责润色，不新增事实
-- NapCat 插件：QQ 世界适配层，负责消息接入、session 路由、审批桥接、控制面拦截、真实消息落地
+## 致谢
 
-已经移除的旧兼容方向：
+本插件参考了麦麦聊天机器人项目 MaiBot，在“面向真实社群关系的聊天机器人”这条方向上受益很多，特此致谢：
 
-- `chat`
-- `chat-brain`
-- `chat-surface`
-- `planner`
-- 插件内的 precheck / dual-brain / 单脑群聊 fallback
+- MaiBot：<https://github.com/Mai-with-u/MaiBot>
 
-也就是说，这个插件现在不再维护“多套群聊脑并存”的兼容逻辑，正式群聊回复主链只有一条：
+## 这个插件是什么
+
+这个插件负责五件事：
+
+1. 把 NapCat / QQ 世界接到 OpenClaw
+2. 把群聊真实历史沉淀为 canonical ledger
+3. 把正式群聊回合稳定路由到 `persona-core -> voice-organ`
+4. 把审批、控制面和异步补结果纳入同一个运行时边界
+5. 给 reflection 与 daily memory 提供样本和维护入口
+
+这个插件不再负责：
+
+- 旧 `chat / chat-brain / chat-surface / planner` 群聊兼容链路
+- 多套群聊脑长期并存
+- 靠 prompt 打补丁维持人格连续性
+
+正式群聊主链只有一条：
 
 `NapCat inbound -> persona-core runtime run -> voice-organ -> QQ outbound`
 
-## 这个插件在做什么
+## 核心框架
 
-它做的不是“帮 OpenClaw 发 QQ 消息”这么简单，而是把 QQ 群聊包装成一个对人格体友好的世界接口：
+### 1. 主链
 
-- 任何群里 `@` 机器人，可以立即触发人格体正式回合
-- 白名单群会缓冲最近消息，并按时间或消息条数触发 periodic check
-- 插件自己维护 canonical ledger，保存“世界真相”
-- 人格连续性由稳定 `sessionKey` 维持
-- `exec` 审批通过 NapCat 私聊桥接到管理员
-- `/approve`、`/reflect` 属于控制平面，会被前置拦截，不进入普通聊天会话
-- QQ 图片、视频、文件都能原生发送
-- Markdown、图片 URL、`<qqimg>/<qqvideo>/<qqfile>` 之类输出会被自动整理成 QQ 可发送格式
+- `persona-core`：唯一正式群聊主脑，决定是否说话以及核心意思
+- `voice-organ`：唯一表达器官，把核心意思改写得更自然，但不新增事实
+- NapCat 插件：世界适配层、canonical ledger、控制面入口、审批桥接层
 
-## 目前最重要的创新点
+### 2. 三层记忆
 
-### 1. runtime-first，而不是聊天接口拼装
+- canonical ledger：插件维护，保存“世界真相”
+  内容包括群消息、图片摘要、最终发出的机器人消息、reply anchor、engagement state
+- agent session：OpenClaw runtime 维护，保存人格连续性
+  内容包括最近几轮内部理解、工具调用、system events
+- reflection / daily memory：位于两者之间
+  用来把真实聊天样本逐步沉淀为人格自己的可吸收材料
 
-`persona-core` 和 `voice-organ` 走的是 OpenClaw runtime agent run，不是把 QQ 消息临时包一层再手写 `/v1/chat/completions` 主链。
+### 3. 控制面
 
-这意味着：
+- `/approve ...`：管理员私聊入口，用于处理 `exec` 审批
+- `/reflect [groupId] [limit]`：管理员私聊入口，用于手动触发 reflection
+- 插件会在普通聊天流之前拦截这些命令，避免污染正式会话
 
-- 工具调用会进入真实 agent session
-- `exec` 审批可以接上 OpenClaw 原生机制
-- 后续的 reflection、memory、followup 才有机会和同一人格连续体对齐
+### 4. 维护循环
 
-### 2. canonical ledger + agent session 双层记忆
+- 自动 reflection：后台 heartbeat 批量消费 pending reflection samples
+- daily memory：后台 heartbeat 按“日期 + 群”增量沉淀 `memory/YYYY-MM-DD.md`
+- async followup：审批完成后的结果先进入 followup job，再尽量回到 persona/voice 语义
 
-插件侧保存的是“世界真相”：
+## 从零开始安装
 
-- 谁说了什么
-- 图片/媒体是什么
-- 最终实际发出去的话是什么
-- 群聊 engagement 状态是什么
+下面这套流程按“原生 OpenClaw + NapCat + 本插件”来写，目标是从头到尾跑通。
 
-agent session 保存的是“人格内部连续性”：
+### 0. 前置条件
 
-- 最近几轮自己怎么理解世界
-- 自己的工具调用历史
-- 自己的表达惯性
+你至少需要准备好：
 
-这两层不会互相替代。
+- 一套可运行的 OpenClaw
+- Node.js `>= 22`
+- 一个可正常登录 QQ 的 NapCat 环境
+- 一个用来收审批和控制面消息的管理员 QQ
+- 至少 3 个 OpenClaw agent：
+  `main`、`persona-core`、`voice-organ`
 
-### 3. 人格进化被当成正式系统目标，而不是 prompt 装饰
+如果你只装插件、不准备 `persona-core / voice-organ`，插件当然能被加载，但你得不到这套“独立人格主链”的核心价值。
 
-当前已经具备的基础：
+### 1. 配置 NapCat
 
-- 每次正式群聊回复后，会把 `persona_draft -> voice_final` 样本写入 reflection sample
-- `/reflect` 可以手动触发 `persona-core` 的 reflection 模式
-- 审批、失败、异步补结果这些边界情况，都会影响人格体真实看到的历史和未来可吸收的表达样本
+先在 NapCat 侧完成 QQ 登录，并启用 OneBot v11 WebSocket 服务。
 
-接下来要做的，不是再叠更多“聊天模板”，而是让人格体能在控制边界内逐步更新自己的长期记忆与表达习惯。
+你需要确认这几个信息：
 
-## 当前行为边界
+- `host`
+  推荐 `127.0.0.1`
+- `port`
+  例如 `3001`
+- `path`
+  默认 `/`
+- `access token`
+  强烈建议设置，不要裸奔
 
-### 已支持
+推荐做法：
 
-- 群聊 `@` 触发人格体即时回复
-- 白名单群 periodic check
-- 群聊图片理解与图片摘要注入
-- `voice-organ` 默认改写，不再只是复读 `persona-core`
-- `exec` 审批通过 NapCat 私聊发给管理员
-- `/approve` 与 `/reflect` 控制面拦截
-- 审批等待时，不会再提前输出一版假的最终答案
-- 审批完成后的异步结果会尽量补走一次 `voice-organ`
+- 让 NapCat 只监听本机回环地址
+- 如果 OpenClaw 与 NapCat 不在同一台机器上，只通过受控内网、Tailscale 或反向代理暴露
+- 不要把 NapCat WebSocket 直接暴露到公网
 
-### 还没有完成
+### 2. 准备 OpenClaw agent 结构
 
-- 自动 reflection 调度
-- 当日聊天记录自动沉淀到 persona memory
-- 更稳的 async followup 统一回到 `persona -> voice` 主链
+推荐保留三个主体：
 
-## 安装
+- `main`
+  负责可信私聊、控制面、日常维护
+- `persona-core`
+  负责正式群聊人格回合、reflection、daily memory 写入
+- `voice-organ`
+  负责群聊表达润色，不应该拥有读写/exec 等高权限工具
+
+推荐目录布局：
+
+```text
+~/.openclaw/
+  agents/
+    main/
+    persona-core/
+    voice-organ/
+  workspace/
+  workspace-persona-core/
+  workspace-voice-organ/
+  extensions/
+    napcat-qq/
+```
+
+### 3. 拉取并构建插件
 
 ```bash
+mkdir -p ~/.openclaw/extensions
 git clone https://github.com/saymyzj/openclaw-NapCatQQ ~/.openclaw/extensions/napcat-qq
 cd ~/.openclaw/extensions/napcat-qq
 npm install
 npm run build
 ```
 
-然后在 `openclaw.json` 中启用插件，并重启 OpenClaw gateway。
+### 4. 用原生 OpenClaw 安装插件
 
-## 推荐的 OpenClaw 配置形态
+原生安装方式优先推荐：
 
-现在推荐的本地布局只保留三类主体：
+```bash
+openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
+```
 
-- `main`
-  用于可信私聊、控制面、人工维护
-- `persona-core`
-  用于正式群聊人格回合与 reflection
-- `voice-organ`
-  用于群聊表达润色
+这个命令通常会把插件写进你的 `openclaw.json` 的 `plugins` 段，包括：
 
-一个简化后的示意配置：
+- `plugins.allow`
+- `plugins.load.paths`
+- `plugins.entries`
+- `plugins.installs`
+
+如果你更喜欢手动管理，也可以自己编辑 `openclaw.json`，但推荐先让原生命令落一版，再按需微调。
+
+### 5. 配置 `openclaw.json`
+
+下面是一份推荐的单账号配置形态。它不是最小配置，而是更接近“独立人格运行时”的实际部署配置。
 
 ```jsonc
 {
@@ -139,7 +184,16 @@ npm run build
         "agentDir": "/path/to/agents/persona-core/agent",
         "model": "openai-codex/gpt-5.4",
         "tools": {
-          "allow": ["read", "write", "edit", "apply_patch", "exec", "web_fetch", "memory_search", "memory_get"],
+          "allow": [
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "exec",
+            "web_fetch",
+            "memory_search",
+            "memory_get"
+          ],
           "exec": {
             "host": "gateway",
             "security": "allowlist",
@@ -207,22 +261,32 @@ npm run build
       "host": "127.0.0.1",
       "port": 3001,
       "accessToken": "<napcat_access_token>",
+      "path": "/",
       "monitorGroups": [123456789],
       "autoIntervene": true,
       "autoCheckIntervalMs": 30000,
       "autoCheckMessageThreshold": 10,
-      "whitelistUserIds": ["1234567890"],
-      "admins": ["1234567890"],
       "historyLimit": 100,
       "rateLimitMs": 1000,
       "renderMarkdownToPlain": true,
       "multimodalImagesEnabled": true,
       "multimodalImageMaxCount": 3,
+      "whitelistUserIds": ["1234567890"],
+      "admins": ["1234567890"],
       "persona": {
         "enabled": true,
         "coreAgentId": "persona-core",
         "voiceAgentId": "voice-organ",
         "voiceOnGroupOnly": true
+      },
+      "maintenance": {
+        "enabled": true,
+        "reflectionEnabled": true,
+        "reflectionIntervalMs": 300000,
+        "reflectionBatchSize": 5,
+        "dailyMemoryEnabled": true,
+        "dailyMemoryIntervalMs": 900000,
+        "dailyMemoryBatchSize": 2
       },
       "disableCommandsForAgents": ["persona-core", "voice-organ"]
     }
@@ -230,57 +294,196 @@ npm run build
 }
 ```
 
-## 人格进化相关说明
+### 6. 重启 OpenClaw / Gateway
 
-这个插件里，“人格进化”现在不是抽象概念，而是一个明确的工程分层：
+完成配置后，重启 OpenClaw gateway。插件正常加载时，你应该能在日志里看到：
 
-- 聊天正式回合：
-  `persona-core` 决定要不要说、说什么核心意思
-- 表达器官：
-  `voice-organ` 把核心意思改写成更自然的群友语气
-- 样本沉淀：
-  插件把 `persona_draft / voice_final / context_excerpt` 写成 reflection sample
-- 手动反思：
-  管理员私聊 `/reflect`
-- 下一步：
-  heartbeat / cron 自动消费 pending reflection samples
-- 再下一步：
-  保存当日聊天记录，沉淀 daily memory，再由 reflection 决定哪些内容上升为长期记忆
+```text
+[plugins] [napcat] plugin loaded
+```
 
-## 为什么不再保留旧兼容链路
+## 配置参数说明
 
-因为“多套脑并行 + 旧 fallback 长期共存”会带来三个问题：
+下面这一节以 `channels.napcat` 为准。
 
-- 人格体并不真的拥有会话连续性
-- 审批、工具、私聊回传会变得不可靠
-- 后续做 reflection 和 memory 时，历史会混进不属于人格体自己的输出
+### 基础连接
 
-所以这个仓库现在明确选择：
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `host` | 是 | NapCat WebSocket 地址，通常是 `127.0.0.1` |
+| `port` | 是 | NapCat WebSocket 端口 |
+| `accessToken` | 强烈建议 | NapCat 访问令牌 |
+| `path` | 否 | WebSocket 路径，默认 `/` |
 
-- 删掉旧群聊兼容链路
-- 只维护 persona 主链
-- 把精力留给自动 reflection、daily memory、async followup 收敛
+### 群聊行为
 
-## 参考与感谢
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `monitorGroups` | 否 | 白名单群号列表；这些群会启用 periodic patrol |
+| `autoIntervene` | 否 | 是否启用白名单群自动巡检 |
+| `autoCheckIntervalMs` | 否 | 巡检间隔，默认 `30000` |
+| `autoCheckMessageThreshold` | 否 | 累积消息阈值，默认 `10` |
+| `requireMention` | 否 | 是否强制只有被 `@` 时才立即处理 |
+| `historyLimit` | 否 | 插件侧历史上下文保留条数 |
+| `rateLimitMs` | 否 | 发送节流，避免 QQ 侧限流 |
 
-这个仓库直接受益于以下项目与规范：
+### 多模态与输出
 
-- [openclaw/openclaw](https://github.com/openclaw/openclaw)
-  感谢 OpenClaw 提供 agent runtime、tooling、session、approval 与插件运行时。
-- [NapNeko/NapCatQQ](https://github.com/NapNeko/NapCatQQ)
-  感谢 NapCat 提供 QQ 到 OneBot v11 的稳定桥接能力。
-- [botuniverse/onebot-v11](https://github.com/botuniverse/onebot-v11)
-  感谢 OneBot v11 规范提供统一的动作/事件模型，让 QQ 适配层可以更清晰地工程化。
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `renderMarkdownToPlain` | 否 | 是否把 Markdown 压成纯文本再发 QQ |
+| `multimodalImagesEnabled` | 否 | 是否开启图片摘要 / 问图能力 |
+| `multimodalImageMaxCount` | 否 | 单轮最多处理几张图片 |
 
-如果没有这些上游工作，这个插件不会长成现在这个样子。谢谢。
+### 人格主链
 
-## 接下来的任务
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `persona.enabled` | 否 | 是否启用人格主链 |
+| `persona.coreAgentId` | 否 | 正式群聊主脑，默认 `persona-core` |
+| `persona.voiceAgentId` | 否 | 表达器官，默认 `voice-organ` |
+| `persona.voiceOnGroupOnly` | 否 | 是否仅在群聊使用 `voice-organ` |
 
-- 自动 reflection：从手动 `/reflect` 走向 heartbeat + cron 调度
-- daily memory：存储当日聊天记录，供人格体进行日级回顾
-- async followup 收敛：让审批后、异步查完后的结果也稳定回到 `persona -> voice` 主链
-- 更稳定的 persona 文件维护边界：避免 reflection 修改超出人格工作区的内容
+### 自动维护
 
-## 许可证
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `maintenance.enabled` | 否 | 是否启用后台维护循环 |
+| `maintenance.reflectionEnabled` | 否 | 是否自动跑 reflection backlog |
+| `maintenance.reflectionIntervalMs` | 否 | reflection 心跳间隔 |
+| `maintenance.reflectionBatchSize` | 否 | 每次处理多少条 reflection sample |
+| `maintenance.dailyMemoryEnabled` | 否 | 是否自动沉淀 daily memory |
+| `maintenance.dailyMemoryIntervalMs` | 否 | daily memory 心跳间隔 |
+| `maintenance.dailyMemoryBatchSize` | 否 | 每次处理多少个群的增量 |
 
-MIT
+### 管理与安全
+
+| 参数 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `whitelistUserIds` | 否 | 私聊白名单；空数组表示所有人可私聊 |
+| `admins` | 强烈建议 | 管理员 QQ 列表，用于审批和控制面 |
+| `disableCommandsForAgents` | 强烈建议 | 在 QQ 会话中对指定 agent 禁用 `/status`、`!bash` 等命令式输入 |
+
+## 如何使用
+
+### 群聊即时回复
+
+- 在任意群里 `@` 机器人
+- 插件会把这一轮正式路由给 `persona-core`
+- 如果 `persona-core` 决定回复，再交给 `voice-organ`
+
+### 白名单群自动巡检
+
+- 把群号放进 `monitorGroups`
+- 插件会在“时间到”或“消息数达到阈值”时做 periodic patrol
+- 如果人格体判断值得参与，再正式发言
+
+### 管理员控制面
+
+管理员私聊支持：
+
+- `/approve ...`
+  处理 OpenClaw `exec` 审批
+- `/reflect [groupId] [limit]`
+  手动触发 reflection
+
+### 审批后的异步补结果
+
+- 当 `persona-core` 触发需要审批的工具动作时，群里先收到一条等待提示
+- 审批完成后，插件会把 followup 结果收进持久化 job
+- 发送前会尽量重新走 persona / voice finalize
+- 同一份 followup 结果会做去重，避免重复发群
+
+## 风险、安全边界与推荐策略
+
+### 1. 网络与 QQ 账号风险
+
+风险：
+
+- NapCat WebSocket 一旦裸露到公网，等同于把 QQ 机器人入口直接暴露出去
+- `accessToken` 泄露后，攻击者可能伪造或读取频道流量
+
+策略：
+
+- 默认只监听 `127.0.0.1`
+- 必须设置 `accessToken`
+- 跨机部署时只走受控内网、VPN、Tailscale 或零信任代理
+
+### 2. 群聊隐私与本地落盘风险
+
+风险：
+
+- 插件会把群消息、图片摘要、reflection sample、followup job 写到本地 sqlite
+- 这意味着你要对磁盘、备份、日志和导出文件负责
+
+策略：
+
+- 只监控你明确同意纳入系统的群
+- 对运行机器做磁盘加密和账户隔离
+- 谨慎备份 `group_chat.sqlite`、workspace 和记忆文件
+
+### 3. 工具执行风险
+
+风险：
+
+- `persona-core` 可以拥有 `exec`
+- 如果审批边界太宽，模型有可能把高风险操作推到管理员确认链路上
+
+策略：
+
+- 只给 `persona-core` 打开真正需要的工具
+- `exec` 必须走 OpenClaw 原生审批
+- 管理员目标必须是你自己可控的私聊 QQ
+- 审批前先看清命令和意图，不要机械同意
+
+### 4. 人格与表达边界
+
+风险：
+
+- 如果让 `voice-organ` 拥有工具、读写或系统访问权限，它就不再只是表达器官
+- 如果把所有群聊碎片无差别提升为长期记忆，人格会很快漂移
+
+策略：
+
+- `voice-organ` 保持无工具、无读写的窄权限
+- 长期记忆留给 `persona-core` 在 reflection / daily memory 中慢慢吸收
+- 不要让单次对话直接重写 `SOUL.md`
+
+### 5. QQ 侧命令注入风险
+
+风险：
+
+- 用户在 QQ 里直接发 `/status`、`!bash`、`/model` 之类的字符串，可能污染会话或误触控制语义
+
+策略：
+
+- 把 `persona-core`、`voice-organ` 加进 `disableCommandsForAgents`
+- 控制面只走管理员私聊
+
+## 当前实现边界
+
+### 已支持
+
+- 群聊 `@` 触发正式人格回合
+- 白名单群 periodic patrol
+- 图片摘要与问图上下文
+- `persona-core -> voice-organ` 正式主链
+- `exec` 审批桥接到管理员私聊
+- `/approve` 与 `/reflect` 控制面拦截
+- 自动 reflection heartbeat
+- daily memory 增量沉淀
+- 审批 followup 持久化与去重
+
+### 当前策略说明
+
+- 自动维护目前默认由插件内 heartbeat 驱动
+- 如果你已经有成熟的 OpenClaw cron 体系，可以再把维护任务拆到 cron，但 README 这里先按插件原生维护循环说明
+
+## 为什么这个插件值得单独存在
+
+因为它解决的不是“QQ 上能不能发消息”，而是下面这件更难的事：
+
+把 QQ 群聊接到一个持续存在、拥有会话连续性、能接受审批约束、能沉淀真实表达样本、还能逐步形成稳定人格记忆的 OpenClaw runtime 里。
+
+如果你要的只是“QQ 自动回复”，这套东西会显得重。
+如果你要的是“独立人格体在 QQ 里长期活着”，这套分层就是必要成本。

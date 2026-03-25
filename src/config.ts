@@ -41,6 +41,25 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
             voiceOnGroupOnly: channel.persona.voiceOnGroupOnly !== false,
           }
         : undefined,
+      maintenance: channel.maintenance
+        ? {
+            enabled: channel.maintenance.enabled !== false,
+            reflectionEnabled: channel.maintenance.reflectionEnabled !== false,
+            reflectionIntervalMs: Math.max(60_000, Number(channel.maintenance.reflectionIntervalMs ?? 300_000)),
+            reflectionBatchSize: Math.max(1, Number(channel.maintenance.reflectionBatchSize ?? 5)),
+            dailyMemoryEnabled: channel.maintenance.dailyMemoryEnabled !== false,
+            dailyMemoryIntervalMs: Math.max(60_000, Number(channel.maintenance.dailyMemoryIntervalMs ?? 900_000)),
+            dailyMemoryBatchSize: Math.max(1, Number(channel.maintenance.dailyMemoryBatchSize ?? 2)),
+          }
+        : {
+            enabled: true,
+            reflectionEnabled: true,
+            reflectionIntervalMs: 300_000,
+            reflectionBatchSize: 5,
+            dailyMemoryEnabled: true,
+            dailyMemoryIntervalMs: 900_000,
+            dailyMemoryBatchSize: 2,
+          },
       whitelistUserIds: channel.whitelistUserIds ?? [],
       admins: channel.admins ?? [],
       disableCommandsForAgents: Array.isArray(channel.disableCommandsForAgents)

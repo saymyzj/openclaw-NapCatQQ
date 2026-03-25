@@ -56,6 +56,15 @@ export interface NapCatConfig {
     voiceAgentId?: string;
     voiceOnGroupOnly?: boolean;
   };
+  maintenance?: {
+    enabled?: boolean;
+    reflectionEnabled?: boolean;
+    reflectionIntervalMs?: number;
+    reflectionBatchSize?: number;
+    dailyMemoryEnabled?: boolean;
+    dailyMemoryIntervalMs?: number;
+    dailyMemoryBatchSize?: number;
+  };
   whitelistUserIds?: number[];
   admins?: number[];
   disableCommandsForAgents?: string[];

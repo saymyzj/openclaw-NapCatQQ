@@ -1,8 +1,8 @@
 {
   "id": "openclaw-napcat",
   "name": "NapCat QQ Channel",
-  "version": "1.0.0",
-  "description": "NapCat (OneBot v11) channel plugin — any group @mention instant reply + whitelisted group periodic patrol",
+  "version": "2.0.0",
+  "description": "OpenClaw 的 NapCat QQ 插件 / OpenClaw NapCat QQ plugin，独立人格主链、审批桥接、reflection 与 daily memory。",
   "channels": ["napcat"],
   "skills": ["skills/napcat-ops"],
   "capabilities": {
@@ -14,89 +14,207 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "host": { "type": "string", "description": "NapCat WebSocket 主机地址", "default": "127.0.0.1" },
-      "port": { "type": "number", "description": "NapCat WebSocket 端口", "default": 3001 },
-      "accessToken": { "type": "string", "description": "NapCat access token（可选）" },
-      "path": { "type": "string", "description": "WebSocket 路径", "default": "/" },
+      "host": {
+        "type": "string",
+        "description": "NapCat WebSocket 主机地址，推荐 127.0.0.1"
+      },
+      "port": {
+        "type": "number",
+        "description": "NapCat WebSocket 端口，例如 3001"
+      },
+      "accessToken": {
+        "type": "string",
+        "description": "NapCat WebSocket access token，强烈建议设置"
+      },
+      "path": {
+        "type": "string",
+        "description": "NapCat WebSocket 路径，默认 /"
+      },
       "monitorGroups": {
         "type": "array",
         "items": { "type": "number" },
-        "description": "白名单群号列表，这些群会定期巡检并让 AI 判断是否参与。空数组 = 不主动监控，仅响应 @"
+        "description": "启用 periodic patrol 的白名单群号列表；空数组表示只响应 @"
       },
       "autoIntervene": {
         "type": "boolean",
         "default": true,
-        "description": "是否启用白名单群的定期巡检（需配合 monitorGroups 使用）"
+        "description": "是否启用白名单群自动巡检"
       },
       "autoInterveneKeywords": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "触发自动介入的关键词列表（备用，巡检时 AI 自行判断）"
+        "description": "备用触发关键词列表；当前主判断仍由人格主链完成"
       },
       "autoIntervenePrompt": {
         "type": "string",
-        "description": "巡检时附加给 AI 的额外指引提示词"
+        "description": "给自动巡检的附加提示词"
       },
       "autoCheckIntervalMs": {
         "type": "number",
         "default": 30000,
-        "description": "白名单群巡检时间间隔（毫秒），默认 30 秒"
+        "description": "白名单群巡检时间间隔（毫秒）"
       },
       "autoCheckMessageThreshold": {
         "type": "number",
         "default": 10,
-        "description": "白名单群消息累积数量阈值，达到即触发巡检，默认 10 条"
+        "description": "白名单群消息累积阈值，达到即触发巡检"
       },
-      "preCheckAgentId": {
-        "type": "string",
-        "default": "planner",
-        "description": "定期巡检预筛选使用的 OpenClaw agent ID。该 agent 建议使用最小 workspace、无工具、无记忆。"
-      },
-      "preCheckModel": {
-        "type": "string",
-        "description": "可选模型字段。当前更推荐通过 preCheckAgentId 控制预筛选 agent，再由该 agent 自己决定实际模型。"
+      "requireMention": {
+        "type": "boolean",
+        "default": false,
+        "description": "是否要求显式 @ 才立即进入正式群聊回合"
       },
       "historyLimit": {
         "type": "number",
         "default": 20,
-        "description": "会话历史保留条数"
+        "description": "插件侧历史上下文保留条数"
       },
       "rateLimitMs": {
         "type": "number",
         "default": 1000,
-        "description": "消息发送间隔（毫秒），防止被限制"
+        "description": "QQ 消息发送节流（毫秒）"
       },
       "renderMarkdownToPlain": {
         "type": "boolean",
         "default": true,
-        "description": "是否将 AI 回复中的 Markdown 转为纯文本再发送"
+        "description": "是否把 Markdown 压成纯文本再发送"
+      },
+      "multimodalImagesEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否启用图片摘要与问图能力"
+      },
+      "multimodalImageMaxCount": {
+        "type": "number",
+        "default": 3,
+        "description": "单轮最多处理的图片数量"
+      },
+      "persona": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "人格主链配置",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否启用 persona-core -> voice-organ 主链"
+          },
+          "coreAgentId": {
+            "type": "string",
+            "default": "persona-core",
+            "description": "正式群聊主脑 agent ID"
+          },
+          "voiceAgentId": {
+            "type": "string",
+            "default": "voice-organ",
+            "description": "表达器官 agent ID"
+          },
+          "voiceOnGroupOnly": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否仅在群聊使用 voice-organ"
+          }
+        }
+      },
+      "maintenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "后台维护循环配置",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否启用后台维护循环"
+          },
+          "reflectionEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否自动消费 reflection backlog"
+          },
+          "reflectionIntervalMs": {
+            "type": "number",
+            "default": 300000,
+            "description": "reflection 心跳间隔（毫秒）"
+          },
+          "reflectionBatchSize": {
+            "type": "number",
+            "default": 5,
+            "description": "每次处理的 reflection sample 数量"
+          },
+          "dailyMemoryEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否自动沉淀 daily memory"
+          },
+          "dailyMemoryIntervalMs": {
+            "type": "number",
+            "default": 900000,
+            "description": "daily memory 心跳间隔（毫秒）"
+          },
+          "dailyMemoryBatchSize": {
+            "type": "number",
+            "default": 2,
+            "description": "每次处理的群数量"
+          }
+        }
       },
       "whitelistUserIds": {
         "type": "array",
-        "items": { "type": "number" },
-        "description": "私聊白名单 QQ 号，空数组 = 所有人可私聊"
+        "items": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" }
+          ]
+        },
+        "description": "允许私聊机器人的 QQ 号列表；空数组表示不限制"
       },
       "admins": {
         "type": "array",
-        "items": { "type": "number" },
-        "description": "管理员 QQ 号列表"
+        "items": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" }
+          ]
+        },
+        "description": "管理员 QQ 列表；用于审批和控制面命令"
       },
       "disableCommandsForAgents": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "对这些 agent 路由禁用 QQ 侧命令风格输入（如 /status、/model、/reset、!bash）。默认建议至少包含 chat 和 planner。"
+        "description": "在 QQ 会话里禁用命令式输入的 agent 列表，推荐至少包含 persona-core 和 voice-organ"
       }
-    }
+    },
+    "required": ["host", "port"]
   },
   "uiHints": {
-    "accessToken": { "label": "Access Token", "sensitive": true },
-    "host": { "label": "主机地址", "placeholder": "127.0.0.1" },
-    "port": { "label": "端口", "placeholder": "3001" },
-    "monitorGroups": { "label": "白名单群号（定期巡检）" },
-    "autoIntervene": { "label": "启用定期巡检" },
-    "autoCheckIntervalMs": { "label": "巡检间隔（毫秒）", "placeholder": "30000" },
-    "autoCheckMessageThreshold": { "label": "巡检消息阈值", "placeholder": "10" },
-    "preCheckAgentId": { "label": "预筛选 Agent ID", "placeholder": "planner" },
-    "whitelistUserIds": { "label": "私聊白名单 QQ 号" }
+    "host": {
+      "label": "NapCat Host",
+      "placeholder": "127.0.0.1"
+    },
+    "port": {
+      "label": "NapCat Port",
+      "placeholder": "3001"
+    },
+    "accessToken": {
+      "label": "Access Token",
+      "sensitive": true
+    },
+    "monitorGroups": {
+      "label": "Monitor Groups"
+    },
+    "autoCheckIntervalMs": {
+      "label": "Patrol Interval (ms)",
+      "placeholder": "30000"
+    },
+    "autoCheckMessageThreshold": {
+      "label": "Patrol Threshold",
+      "placeholder": "10"
+    },
+    "whitelistUserIds": {
+      "label": "Direct Message Whitelist"
+    },
+    "admins": {
+      "label": "Admins"
+    }
   }
 }
