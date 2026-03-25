@@ -475,8 +475,8 @@ export function normalizePersonaTurn(raw: string): PersonaTurn {
 
 export function normalizeVoiceText(raw: string): string {
   try {
-    const parsed = JSON.parse(raw) as { final_text?: string };
-    const normalized = normalizeString(parsed.final_text, "");
+    const parsed = JSON.parse(raw) as { final_text?: string; text?: string };
+    const normalized = normalizeString(parsed.final_text ?? parsed.text, "");
     if (normalized) return normalized;
   } catch {
     // fall through
