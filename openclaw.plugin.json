@@ -133,7 +133,7 @@
           },
           "reflectionIntervalMs": {
             "type": "number",
-            "default": 300000,
+            "default": 43200000,
             "description": "reflection 心跳间隔（毫秒）"
           },
           "reflectionBatchSize": {

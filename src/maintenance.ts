@@ -88,20 +88,17 @@ export function createMaintenanceLoop(api: any): {
   function start(): void {
     stop();
     const maintenanceCfg = getNapCatConfig(api)?.maintenance;
-    if (!maintenanceCfg?.enabled || !maintenanceCfg.reflectionEnabled) return;
+    if (!maintenanceCfg?.enabled) return;
 
-    const intervalMs = Math.max(60_000, Number(maintenanceCfg.reflectionIntervalMs ?? 300_000));
-    reflectionTimer = setInterval(() => {
-      runReflectionHeartbeat().catch((err: any) => {
-        api.logger?.error?.(`[napcat] maintenance loop failure: ${err?.message}`);
-      });
-    }, intervalMs);
-    setTimeout(() => {
-      runReflectionHeartbeat().catch((err: any) => {
-        api.logger?.error?.(`[napcat] maintenance bootstrap failure: ${err?.message}`);
-      });
-    }, 15_000);
-    api.logger?.info?.(`[napcat] maintenance reflection heartbeat started interval=${intervalMs}ms`);
+    if (maintenanceCfg.reflectionEnabled) {
+      const intervalMs = Math.max(60_000, Number(maintenanceCfg.reflectionIntervalMs ?? 43_200_000));
+      reflectionTimer = setInterval(() => {
+        runReflectionHeartbeat().catch((err: any) => {
+          api.logger?.error?.(`[napcat] maintenance loop failure: ${err?.message}`);
+        });
+      }, intervalMs);
+      api.logger?.info?.(`[napcat] maintenance reflection heartbeat started interval=${intervalMs}ms`);
+    }
 
     if (maintenanceCfg.dailyMemoryEnabled) {
       const dailyMemoryIntervalMs = Math.max(60_000, Number(maintenanceCfg.dailyMemoryIntervalMs ?? 900_000));

@@ -6,7 +6,6 @@ NapCat（OneBot v11）到 OpenClaw 的 QQ 频道插件。
 
 - GitHub：<https://github.com/saymyzj/openclaw-NapCatQQ>
 - English README: [README.en.md](./README.en.md)
-- 中文入口别名：[README.zh-CN.md](./README.zh-CN.md)
 - 贡献说明：[CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ## 亮点
@@ -33,11 +32,6 @@ NapCat（OneBot v11）到 OpenClaw 的 QQ 频道插件。
 4. 把审批、控制面和异步补结果纳入同一个运行时边界
 5. 给 reflection 与 daily memory 提供样本和维护入口
 
-这个插件不再负责：
-
-- 旧 `chat / chat-brain / chat-surface / planner` 群聊兼容链路
-- 多套群聊脑长期并存
-- 靠 prompt 打补丁维持人格连续性
 
 正式群聊主链只有一条：
 
