@@ -219,9 +219,11 @@ export async function requestPersonaTurn(opts: {
           "如果应该说，只给一句你自己本来就愿意发出的核心回复，不要把表达空间提前写死给 voice-organ。",
           "不要输出 markdown，不要输出代码块，不要解释内部机制。",
           "如果当前回合更适合沉默，就输出 action=silence。",
-          "不要使用 exec，也不要调用依赖 exec / shell / python 的 skill。",
-          "如果需要联网找公开信息，优先使用可直接联网的工具；如果确实需要 shell 或脚本，只在 tool_intent 里表达意图，不要自行执行。",
-          "如果需要联网或高风险动作，可以在 tool_intent 中表达，但不要编造已经执行过的结果。",
+          "聊天模式下不要把 exec 当成通用 shell，也不要为了本地文件或系统操作乱用脚本。",
+          "如果用户明确要求联网、搜索、核实最新公开信息，而当前回合确实依赖外部信息，请优先真的执行搜索，而不是只在 tool_intent 里说“应该去查”。",
+          "当内建 web search 不可用、但可用 skill 已注入时，应主动读取并使用对应的搜索 skill；如果存在 tavily-search，就把它视为公开网页检索的首选后备路径。",
+          "允许为了公开网页检索使用经过批准的只读搜索路径，包括依赖 exec / python 的 search skill；但不要把这条例外扩展到无关的本地 shell 动作。",
+          "只有在执行被审批阻塞、工具确实不可用，或当前回合更适合先口头接住时，才把搜索需求留在 tool_intent 中；不要编造已经执行过的结果。",
           "如果你认为某些风格或记忆值得未来吸收，可以在 self_update_intent 里表达，但聊天回合不要求你立刻修改文件。",
         ].join("\n"),
       },
@@ -284,6 +286,8 @@ export async function requestVoiceTurn(opts: {
           "你收到的是本体想表达的核心草稿，不是必须原样照抄的终稿。",
           "默认应当重写措辞，让它更顺口、更像群聊里会发出来的话。",
           "只有在原句已经足够自然、继续改写反而更差时，才允许原样输出。",
+          "输出必须是扁平 JSON：{\"schema_version\":\"voice-organ.turn.v2\",\"final_text\":\"...\"}。",
+          "不要输出 voice_organ、voice-organ、turn、v2、core_text 这类额外嵌套键。",
           "你只有一个任务：输出最终一句话。",
         ].join("\n"),
       },
@@ -474,14 +478,66 @@ export function normalizePersonaTurn(raw: string): PersonaTurn {
 }
 
 export function normalizeVoiceText(raw: string): string {
+  const cleaned = stripReplyCodeFence(raw);
   try {
-    const parsed = JSON.parse(raw) as { final_text?: string; text?: string };
-    const normalized = normalizeString(parsed.final_text ?? parsed.text, "");
+    const parsed = JSON.parse(cleaned) as {
+      final_text?: string;
+      finalText?: string;
+      text?: string;
+      voice_organ?: {
+        turn?: {
+          v2?: string | {
+            core_text?: string;
+            final_text?: string;
+            finalText?: string;
+            text?: string;
+          };
+        };
+      };
+      "voice-organ"?: {
+        turn?: {
+          v2?: string | {
+            core_text?: string;
+            final_text?: string;
+            finalText?: string;
+            text?: string;
+          };
+        };
+      };
+      delivery?: {
+        final_text?: string;
+        finalText?: string;
+        text?: string;
+      };
+    };
+    const voiceV2 = extractVoiceV2Text(parsed.voice_organ?.turn?.v2)
+      || extractVoiceV2Text(parsed["voice-organ"]?.turn?.v2);
+    const normalized = normalizeString(
+      parsed.final_text ??
+      parsed.finalText ??
+      parsed.text ??
+      voiceV2 ??
+      parsed.delivery?.final_text ??
+      parsed.delivery?.finalText ??
+      parsed.delivery?.text,
+      "",
+    );
     if (normalized) return normalized;
   } catch {
     // fall through
   }
-  return raw.replace(/^```(?:json|text|markdown)?/i, "").replace(/```$/i, "").trim();
+  return cleaned;
+}
+
+export function normalizeOutboundReplyText(raw: string): string {
+  const cleaned = stripReplyCodeFence(raw);
+  const personaPacket = extractPersonaFinalText(cleaned);
+  if (personaPacket.recognized) return personaPacket.text;
+
+  const voicePacket = extractVoiceFinalText(cleaned);
+  if (voicePacket.recognized) return voicePacket.text;
+
+  return cleaned;
 }
 
 function normalizeString(value: unknown, fallback: string): string {
@@ -510,4 +566,123 @@ function normalizeRisk(value: unknown): "low" | "medium" | "high" {
     default:
       return "low";
   }
+}
+
+function stripReplyCodeFence(raw: string): string {
+  return String(raw ?? "").replace(/^```(?:json|text|markdown)?/i, "").replace(/```$/i, "").trim();
+}
+
+function extractPersonaFinalText(raw: string): { recognized: boolean; text: string } {
+  try {
+    const parsed = JSON.parse(raw) as {
+      schema_version?: string;
+      schemaVersion?: string;
+      schemaversion?: string;
+      schema?: string;
+      decision?: unknown;
+      world_model?: unknown;
+      worldModel?: unknown;
+      worldmodel?: unknown;
+      delivery?: {
+        final_text?: string;
+        finalText?: string;
+        finaltext?: string;
+      };
+      final_text?: string;
+      finalText?: string;
+      finaltext?: string;
+    };
+    const schemaVersion = normalizeString(
+      parsed.schema_version ?? parsed.schemaVersion ?? parsed.schemaversion ?? parsed.schema,
+      "",
+    );
+    const finalText = normalizeString(
+      parsed.delivery?.final_text ??
+      parsed.delivery?.finalText ??
+      parsed.delivery?.finaltext ??
+      parsed.final_text ??
+      parsed.finalText ??
+      parsed.finaltext,
+      "",
+    );
+
+    const looksPersonaPacket = schemaVersion.includes("persona-core.turn")
+      || parsed.decision != null
+      || parsed.world_model != null
+      || parsed.worldModel != null
+      || parsed.worldmodel != null;
+
+    return {
+      recognized: looksPersonaPacket,
+      text: looksPersonaPacket ? finalText : "",
+    };
+  } catch {
+    return { recognized: false, text: "" };
+  }
+}
+
+function extractVoiceFinalText(raw: string): { recognized: boolean; text: string } {
+  try {
+    const parsed = JSON.parse(raw) as {
+      schema_version?: string;
+      schemaVersion?: string;
+      schemaversion?: string;
+      final_text?: string;
+      finalText?: string;
+      text?: string;
+      voice_organ?: {
+        turn?: {
+          v2?: string | {
+            core_text?: string;
+            final_text?: string;
+            finalText?: string;
+            text?: string;
+          };
+        };
+      };
+      "voice-organ"?: {
+        turn?: {
+          v2?: string | {
+            core_text?: string;
+            final_text?: string;
+            finalText?: string;
+            text?: string;
+          };
+        };
+      };
+      delivery?: {
+        final_text?: string;
+        finalText?: string;
+        text?: string;
+      };
+    };
+    const schemaVersion = normalizeString(
+      parsed.schema_version ?? parsed.schemaVersion ?? parsed.schemaversion,
+      "",
+    );
+    const recognized = schemaVersion.includes("voice-organ.turn")
+      || parsed.voice_organ != null
+      || parsed["voice-organ"] != null
+      || parsed.final_text != null
+      || parsed.finalText != null
+      || parsed.delivery != null;
+    return {
+      recognized,
+      text: recognized ? normalizeVoiceText(raw) : "",
+    };
+  } catch {
+    return { recognized: false, text: "" };
+  }
+}
+
+function extractVoiceV2Text(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (!value || typeof value !== "object") return "";
+  return normalizeString(
+    (value as any).core_text ??
+    (value as any).final_text ??
+    (value as any).finalText ??
+    (value as any).text,
+    "",
+  );
 }

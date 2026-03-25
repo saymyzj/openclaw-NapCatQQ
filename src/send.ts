@@ -16,6 +16,7 @@ import { resolveTargetForReply } from "./reply-context.js";
 import { getRenderMarkdownToPlain } from "./config.js";
 import { markdownToPlain, collapseDoubleNewlines } from "./markdown.js";
 import { finalizePendingApprovalFollowup } from "./pending-approval.js";
+import { normalizeOutboundReplyText } from "./persona.js";
 import type { NapCatConfig, SendResult } from "./types.js";
 
 type ConfigGetter = () => NapCatConfig | null;
@@ -45,7 +46,8 @@ export async function sendTextMessage(
   if (!target) return { ok: false, error: `Invalid target: ${to}` };
   if (!text?.trim()) return { ok: false, error: "No text provided" };
 
-  let finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(text) : text.trim();
+  let finalText = normalizeOutboundReplyText(text.trim());
+  finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(finalText) : finalText;
   finalText = collapseDoubleNewlines(finalText);
   const followupResult = await finalizePendingApprovalFollowup({
     target,
@@ -75,7 +77,8 @@ export async function sendMediaMessage(
   if (!target) return { ok: false, error: `Invalid target: ${to}` };
   if (!mediaUrl?.trim()) return { ok: false, error: "No mediaUrl provided" };
 
-  let finalText = text?.trim() ? (getRenderMarkdownToPlain(cfg) ? markdownToPlain(text) : text.trim()) : "";
+  let finalText = text?.trim() ? normalizeOutboundReplyText(text.trim()) : "";
+  if (finalText) finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(finalText) : finalText;
   if (finalText) finalText = collapseDoubleNewlines(finalText);
 
   try {
@@ -110,7 +113,8 @@ export async function sendVideoMessage(
   try {
     let messageId: number | undefined;
     if (text?.trim()) {
-      const finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(text) : text.trim();
+      const normalizedText = normalizeOutboundReplyText(text.trim());
+      const finalText = getRenderMarkdownToPlain(cfg) ? markdownToPlain(normalizedText) : normalizedText;
       if (target.type === "group") await sendGroupMsg(target.id, finalText, getConfig);
       else await sendPrivateMsg(target.id, finalText, getConfig);
     }

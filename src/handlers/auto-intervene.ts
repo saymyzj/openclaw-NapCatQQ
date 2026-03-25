@@ -11,8 +11,10 @@ import { getSenderName, getTextFromSegments, isMentioned } from "../message.js";
 import {
   insertGroupMessage,
   appendGroupMessageSummary,
+  getGroupMessagesAfterId as getGroupMessagesAfterIdDb,
   getRecentGroupMessages as getRecentGroupMessagesDb,
   getUnrepliedGroupMessages as getUnrepliedGroupMessagesDb,
+  getGroupMessagesAfterTimestamp as getGroupMessagesAfterTimestampDb,
   getMessagesSinceLastReply as getMessagesSinceLastReplyDb,
   getGroupReplyAnchor as getGroupReplyAnchorDb,
   cleanupOldMessages,
@@ -80,6 +82,30 @@ export function getUnrepliedGroupMessages(groupId: number | string, limit = 50):
 export function getMessagesSinceLastReply(groupId: number | string, limit = 100): HistoryEntry[] {
   const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
   const messages = getMessagesSinceLastReplyDb(numGroupId, limit);
+  return messages.map(msg => ({
+    sender: String(msg.sender_name),
+    senderName: msg.sender_name,
+    body: msg.content,
+    timestamp: msg.timestamp,
+    messageId: String(msg.id),
+  }));
+}
+
+export function getGroupMessagesAfterTimestamp(groupId: number | string, afterTs: number, limit = 20): HistoryEntry[] {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  const messages = getGroupMessagesAfterTimestampDb(numGroupId, Number(afterTs), limit);
+  return messages.map(msg => ({
+    sender: String(msg.sender_name),
+    senderName: msg.sender_name,
+    body: msg.content,
+    timestamp: msg.timestamp,
+    messageId: String(msg.id),
+  }));
+}
+
+export function getGroupMessagesAfterId(groupId: number | string, afterId: number, limit = 20): HistoryEntry[] {
+  const numGroupId = typeof groupId === 'string' ? parseInt(groupId, 10) : groupId;
+  const messages = getGroupMessagesAfterIdDb(numGroupId, Number(afterId), limit);
   return messages.map(msg => ({
     sender: String(msg.sender_name),
     senderName: msg.sender_name,

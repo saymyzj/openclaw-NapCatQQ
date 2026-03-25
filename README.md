@@ -64,7 +64,9 @@ NapCat（OneBot v11）到 OpenClaw 的 QQ 频道插件。
 
 - 自动 reflection：后台 heartbeat 批量消费 pending reflection samples
 - daily memory：后台 heartbeat 按“日期 + 群”增量沉淀 `memory/YYYY-MM-DD.md`
+  同一天仍是一个文件，但应按 `## group_id: <id>` 分段
 - async followup：审批完成后的结果先进入 followup job，再尽量回到 persona/voice 语义
+- 图片理解：问图与图片摘要走独立的 vision 子链路，优先复用稳定 session key，避免一张图生成一个新 session transcript
 
 ## 从零开始安装
 
@@ -276,10 +278,10 @@ openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
       "maintenance": {
         "enabled": true,
         "reflectionEnabled": true,
-        "reflectionIntervalMs": 300000,
+        "reflectionIntervalMs": 43200000,
         "reflectionBatchSize": 5,
         "dailyMemoryEnabled": true,
-        "dailyMemoryIntervalMs": 900000,
+        "dailyMemoryIntervalMs": 14400000,
         "dailyMemoryBatchSize": 2
       },
       "disableCommandsForAgents": ["persona-core", "voice-organ"]
@@ -328,6 +330,9 @@ openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
 | `renderMarkdownToPlain` | 否 | 是否把 Markdown 压成纯文本再发 QQ |
 | `multimodalImagesEnabled` | 否 | 是否开启图片摘要 / 问图能力 |
 | `multimodalImageMaxCount` | 否 | 单轮最多处理几张图片 |
+说明：
+图片理解会尽量复用稳定的 vision session key，减少零散 session transcript。
+对 QQ/NapCat 这类图片源，插件会自动回退为内联图片内容，避免被 Gateway 的 URL 安全限制拦掉。
 
 ### 人格主链
 
@@ -347,8 +352,11 @@ openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
 | `maintenance.reflectionIntervalMs` | 否 | reflection 心跳间隔 |
 | `maintenance.reflectionBatchSize` | 否 | 每次处理多少条 reflection sample |
 | `maintenance.dailyMemoryEnabled` | 否 | 是否自动沉淀 daily memory |
-| `maintenance.dailyMemoryIntervalMs` | 否 | daily memory 心跳间隔 |
+| `maintenance.dailyMemoryIntervalMs` | 否 | daily memory 心跳间隔，当前默认 4 小时 |
 | `maintenance.dailyMemoryBatchSize` | 否 | 每次处理多少个群的增量 |
+说明：
+daily memory 不再有“启动后 30 秒补跑”bootstrap；它只在下一个 heartbeat 或手动触发时运行。
+同一天仍写入一个 `memory/YYYY-MM-DD.md`，但推荐严格按 `## group_id: <id>` 分段维护。
 
 ### 管理与安全
 
@@ -407,7 +415,7 @@ openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
 
 风险：
 
-- 插件会把群消息、图片摘要、reflection sample、followup job 写到本地 sqlite
+- 插件会把群消息、图片摘要、reflection sample、followup job、图片缓存索引写到本地 sqlite
 - 这意味着你要对磁盘、备份、日志和导出文件负责
 
 策略：
@@ -415,6 +423,7 @@ openclaw plugins install -l ~/.openclaw/extensions/napcat-qq
 - 只监控你明确同意纳入系统的群
 - 对运行机器做磁盘加密和账户隔离
 - 谨慎备份 `group_chat.sqlite`、workspace 和记忆文件
+- 如果你依赖问图追问能力，要意识到 sqlite 中也会保留可复用的图片缓存记录
 
 ### 3. 工具执行风险
 

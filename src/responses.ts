@@ -14,6 +14,7 @@ export async function summarizeImagesWithResponses(opts: {
   gatewayPort: number;
   gatewayToken: string;
   agentId: string;
+  sessionKey?: string;
   inputText: string;
   imageUrls: string[];
 }): Promise<string> {
@@ -21,6 +22,7 @@ export async function summarizeImagesWithResponses(opts: {
     gatewayPort: opts.gatewayPort,
     gatewayToken: opts.gatewayToken,
     agentId: opts.agentId,
+    sessionKey: opts.sessionKey,
     inputText: opts.inputText,
     imageUrls: opts.imageUrls,
     developerText: [
@@ -39,6 +41,7 @@ export async function answerImagesWithResponses(opts: {
   gatewayPort: number;
   gatewayToken: string;
   agentId: string;
+  sessionKey?: string;
   inputText: string;
   imageUrls: string[];
 }): Promise<string> {
@@ -46,6 +49,7 @@ export async function answerImagesWithResponses(opts: {
     gatewayPort: opts.gatewayPort,
     gatewayToken: opts.gatewayToken,
     agentId: opts.agentId,
+    sessionKey: opts.sessionKey,
     inputText: opts.inputText,
     imageUrls: opts.imageUrls,
     developerText: [
@@ -64,6 +68,7 @@ async function analyzeImagesWithResponses(opts: {
   gatewayPort: number;
   gatewayToken: string;
   agentId: string;
+  sessionKey?: string;
   inputText: string;
   imageUrls: string[];
   developerText: string;
@@ -76,12 +81,22 @@ async function analyzeImagesWithResponses(opts: {
   try {
     const imageItems: OpenResponsesImageInput[] = await Promise.all(
       opts.imageUrls.map(async (url) => {
-        const base64 = await resolveMediaToBase64Cached(url);
+        const trimmedUrl = String(url ?? "").trim();
+        if (/^https?:\/\//i.test(trimmedUrl) && !shouldInlineImageAsBase64(trimmedUrl)) {
+          return {
+            type: "input_image" as const,
+            source: {
+              type: "url" as const,
+              url: trimmedUrl,
+            },
+          };
+        }
+        const base64 = await resolveMediaToBase64Cached(trimmedUrl);
         return {
           type: "input_image" as const,
           source: {
             type: "base64" as const,
-            media_type: inferImageMediaType(url),
+            media_type: inferImageMediaType(trimmedUrl),
             data: base64.startsWith("base64://") ? base64.slice("base64://".length) : base64,
           },
         };
@@ -94,6 +109,7 @@ async function analyzeImagesWithResponses(opts: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${opts.gatewayToken}`,
         "x-openclaw-agent-id": opts.agentId,
+        ...(opts.sessionKey ? { "x-openclaw-session-key": opts.sessionKey } : {}),
       },
       body: JSON.stringify({
         model: "openclaw",
@@ -163,4 +179,18 @@ function inferImageMediaType(url: string): string {
   if (clean.endsWith(".heif")) return "image/heif";
   if (clean.endsWith(".jpg") || clean.endsWith(".jpeg")) return "image/jpeg";
   return "image/jpeg";
+}
+
+function shouldInlineImageAsBase64(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "qq.com"
+      || host.endsWith(".qq.com")
+      || host === "qq.com.cn"
+      || host.endsWith(".qq.com.cn")
+      || host === "qpic.cn"
+      || host.endsWith(".qpic.cn");
+  } catch {
+    return false;
+  }
 }

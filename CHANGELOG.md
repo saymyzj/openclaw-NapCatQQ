@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format loosely follows Keep a Changelog, adapted for a small plugin repository.
 
+## [Unreleased]
+
+### Added
+
+- Persistent message-bound image cache entries in sqlite so quoted/replied images can be reopened after process restarts
+
+### Changed
+
+- Multimodal image-analysis requests now reuse stable vision session keys instead of scattering one-off transcripts per picture
+- QQ-hosted image URLs now fall back to inline image payloads for `/v1/responses`, avoiding Gateway URL-block failures on NapCat media links
+- Daily memory guidance now keeps one `memory/YYYY-MM-DD.md` file but requires explicit `## group_id: <id>` sections
+- Daily memory heartbeat default is now 4 hours, and the startup 30-second bootstrap trigger has been removed
+- Periodic patrol stale suppression now uses a lightweight heuristic: same-speaker follow-ups suppress stale replies, unrelated interleaving speakers do not
+
 ## [2.0.0] - 2026-03-25
 
 ### Added

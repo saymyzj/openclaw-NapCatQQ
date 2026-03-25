@@ -8,6 +8,7 @@ import http from "http";
 import { writeFileSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { cleanupOldMessageMediaCache, getMessageMediaCache, type MessageMediaCacheEntry, upsertMessageMediaCache } from "./db.js";
 import type { NapCatConfig } from "./types.js";
 
 const IMAGE_TEMP_DIR = join(tmpdir(), "openclaw-napcat");
@@ -15,6 +16,7 @@ const DOWNLOAD_TIMEOUT_MS = 30000;
 const IMAGE_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
 const IMAGE_TEMP_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const MEDIA_BASE64_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
+const MESSAGE_MEDIA_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 let ws: WebSocket | null = null;
 const pendingEcho = new Map<string, { resolve: (v: any) => void }>();
@@ -23,7 +25,7 @@ let connectionReadyResolve: (() => void) | null = null;
 const connectionReadyPromise = new Promise<void>((r) => { connectionReadyResolve = r; });
 let imageTempCleanupTimer: ReturnType<typeof setInterval> | null = null;
 const mediaBase64Cache = new Map<string, { value: string; expiresAt: number }>();
-const messageMediaCache = new Map<string, { values: string[]; expiresAt: number }>();
+const messageMediaCache = new Map<string, { values: MessageMediaCacheEntry[]; expiresAt: number }>();
 
 function getLogger(): { info?: (s: string) => void; warn?: (s: string) => void; error?: (s: string) => void } {
   return (globalThis as any).__napCatApi?.logger ?? {};
@@ -78,6 +80,7 @@ function cleanupImageTemp(): void {
   for (const [key, entry] of messageMediaCache.entries()) {
     if (entry.expiresAt <= now) messageMediaCache.delete(key);
   }
+  cleanupOldMessageMediaCache(now - MESSAGE_MEDIA_CACHE_MAX_AGE_MS);
 }
 
 export async function resolveMediaToFile(media: string): Promise<string> {
@@ -136,24 +139,48 @@ export async function resolveMediaToBase64Cached(media: string): Promise<string>
 }
 
 export function rememberMessageMedia(messageId: string | number | undefined, values: string[]): void {
+  const entries = values.map((value) => ({
+    source: String(value || "").trim(),
+    resolved: String(value || "").trim(),
+  }));
+  rememberMessageMediaEntries(messageId, entries);
+}
+
+export function rememberMessageMediaEntries(messageId: string | number | undefined, values: MessageMediaCacheEntry[]): void {
   if (messageId == null) return;
-  const normalized = values.map((v) => String(v || "").trim()).filter(Boolean);
+  const normalized = normalizeMessageMediaEntries(values);
   if (normalized.length === 0) return;
-  messageMediaCache.set(String(messageId), {
+  const now = Date.now();
+  const messageKey = String(messageId);
+  messageMediaCache.set(messageKey, {
     values: normalized,
-    expiresAt: Date.now() + MEDIA_BASE64_CACHE_MAX_AGE_MS,
+    expiresAt: now + MESSAGE_MEDIA_CACHE_MAX_AGE_MS,
   });
+  upsertMessageMediaCache(messageKey, normalized, now);
 }
 
 export function getCachedMessageMedia(messageId: string | number | undefined): string[] {
+  return getCachedMessageMediaEntries(messageId).map((entry) => entry.resolved || entry.source).filter(Boolean);
+}
+
+export function getCachedMessageMediaEntries(messageId: string | number | undefined): MessageMediaCacheEntry[] {
   if (messageId == null) return [];
-  const cached = messageMediaCache.get(String(messageId));
-  if (!cached) return [];
-  if (cached.expiresAt <= Date.now()) {
-    messageMediaCache.delete(String(messageId));
-    return [];
+  const messageKey = String(messageId);
+  const cached = messageMediaCache.get(messageKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return [...cached.values];
   }
-  return [...cached.values];
+  if (cached) {
+    messageMediaCache.delete(messageKey);
+  }
+
+  const persisted = normalizeMessageMediaEntries(getMessageMediaCache(messageKey));
+  if (persisted.length === 0) return [];
+  messageMediaCache.set(messageKey, {
+    values: persisted,
+    expiresAt: Date.now() + MESSAGE_MEDIA_CACHE_MAX_AGE_MS,
+  });
+  return [...persisted];
 }
 
 export function startImageTempCleanup(): void {
@@ -163,6 +190,15 @@ export function startImageTempCleanup(): void {
 
 export function stopImageTempCleanup(): void {
   if (imageTempCleanupTimer) { clearInterval(imageTempCleanupTimer); imageTempCleanupTimer = null; }
+}
+
+function normalizeMessageMediaEntries(values: MessageMediaCacheEntry[]): MessageMediaCacheEntry[] {
+  return values
+    .map((entry) => ({
+      source: String(entry?.source ?? "").trim(),
+      resolved: String(entry?.resolved ?? "").trim(),
+    }))
+    .filter((entry) => entry.source || entry.resolved);
 }
 
 // ─── WebSocket 连接 ───

@@ -101,17 +101,12 @@ export function createMaintenanceLoop(api: any): {
     }
 
     if (maintenanceCfg.dailyMemoryEnabled) {
-      const dailyMemoryIntervalMs = Math.max(60_000, Number(maintenanceCfg.dailyMemoryIntervalMs ?? 900_000));
+      const dailyMemoryIntervalMs = Math.max(60_000, Number(maintenanceCfg.dailyMemoryIntervalMs ?? 14_400_000));
       dailyMemoryTimer = setInterval(() => {
         runDailyMemoryHeartbeat().catch((err: any) => {
           api.logger?.error?.(`[napcat] maintenance daily-memory loop failure: ${err?.message}`);
         });
       }, dailyMemoryIntervalMs);
-      setTimeout(() => {
-        runDailyMemoryHeartbeat().catch((err: any) => {
-          api.logger?.error?.(`[napcat] maintenance daily-memory bootstrap failure: ${err?.message}`);
-        });
-      }, 30_000);
       api.logger?.info?.(`[napcat] maintenance daily-memory heartbeat started interval=${dailyMemoryIntervalMs}ms`);
     }
   }

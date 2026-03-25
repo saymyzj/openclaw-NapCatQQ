@@ -23,9 +23,11 @@ The plugin also:
 
 - maintains canonical QQ-side message history
 - keeps stable session routing for persona continuity
+- reuses stable vision-side session keys for image understanding instead of creating a fresh image-analysis session per picture
 - bridges `exec` approvals into NapCat private chat
 - intercepts `/approve` and `/reflect` as control-plane messages
 - stores reflection samples from `persona draft -> voice final`
+- persists message-bound image cache entries so later follow-up questions can still re-open the original picture context
 
 ## Why This Repository Exists
 
@@ -48,6 +50,6 @@ Thank you to the upstream projects and maintainers. This plugin stands on their 
 
 ## Next Work
 
-- automatic reflection scheduling
-- daily chat-log memory ingestion
-- better async followup routing back into the `persona -> voice` path
+- better semantic stale-check heuristics for periodic patrol turns
+- tighter long-term memory formatting conventions across shared daily-memory files
+- more aggressive transcript-size controls for multimodal helper sessions

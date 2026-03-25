@@ -11,10 +11,11 @@
  *   - 否则处理所有私聊
  */
 
+import { createHash } from "node:crypto";
 import type { OneBotMessage } from "../types.js";
 import { getNapCatConfig, getRenderMarkdownToPlain, getWhitelistUserIds } from "../config.js";
 import { getRawText, getTextFromSegments, getReplyMessageId, getTextFromMessageContent, getImageUrls, getImageUrlsFromMessageContent, isMentioned, getSenderName } from "../message.js";
-import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg, resolveMediaToBase64Cached, rememberMessageMedia, getCachedMessageMedia } from "../connection.js";
+import { sendPrivateMsg, sendGroupMsg, sendPrivateImage, sendGroupImage, sendGroupVideo, sendPrivateVideo, uploadGroupFile, uploadPrivateFile, setMsgEmojiLike, getMsg, resolveMediaToBase64Cached, rememberMessageMediaEntries, getCachedMessageMediaEntries } from "../connection.js";
 import { markdownToPlain, collapseDoubleNewlines } from "../markdown.js";
 import { setActiveReplyTarget, clearActiveReplyTarget, setActiveReplySessionId } from "../reply-context.js";
 import {
@@ -27,13 +28,14 @@ import {
   insertReflectionSample,
 } from "../db.js";
 import { loadPluginSdk, getSdk } from "../sdk.js";
-import { normalizePersonaTurn, normalizeVoiceText, type PersonaTurn } from "../persona.js";
+import { normalizeOutboundReplyText, normalizePersonaTurn, normalizeVoiceText, requestVoiceTurn, type PersonaTurn } from "../persona.js";
 import { registerPendingApprovalSurface } from "../pending-approval.js";
 import { runReflectionBatch } from "../reflection-runner.js";
 import { runAgentTextViaRuntime } from "../runtime-agent.js";
 import {
   recordGroupMessage,
   attachGroupMessageImageSummary,
+  getGroupMessagesAfterId,
   getUnrepliedGroupMessages,
   getMessagesSinceLastReply,
   isMonitoredGroup,
@@ -287,6 +289,7 @@ async function dispatchPeriodicCheck(
   lockPeriodicCheck(groupId);
   let lastMsg: any = null;
   let processedUntilTs = 0;
+  let processedUntilMessageId = 0;
   let activityVersionAtStart = getGroupActivityVersion(groupId);
 
   try {
@@ -299,12 +302,14 @@ async function dispatchPeriodicCheck(
 
     lastMsg = recentMessages[recentMessages.length - 1];
     processedUntilTs = Number(lastMsg?.timestamp ?? 0);
+    processedUntilMessageId = Number(lastMsg?.messageId ?? 0);
     activityVersionAtStart = getGroupActivityVersion(groupId);
 
     const contextSource = getMessagesSinceLastReply(groupId, Math.max(recentMessages.length, 100));
     const sectionImageContext = await maybeBuildSectionImageContext(api, {
       cfg,
       napCatCfg,
+      groupId,
       contextSource,
       recentMessages,
     });
@@ -335,6 +340,8 @@ ${sectionImageContext ? `\n${sectionImageContext}\n` : ""}
       isPeriodicCheck: true,
       replyCheckpointTs: processedUntilTs,
       staleGroupActivityVersion: activityVersionAtStart,
+      stalePeriodicLastMessageId: processedUntilMessageId,
+      stalePeriodicLastSenderName: String(lastMsg?.senderName ?? ""),
     });
   } finally {
     // 巡检结束后推进“已处理”游标，
@@ -409,6 +416,14 @@ async function dispatchImageAwareTurn(
       gatewayPort: cfg?.gateway?.port ?? 18789,
       gatewayToken: cfg?.gateway?.auth?.token ?? "",
       agentId: summaryAgentId,
+      sessionKey: buildVisionSessionKey({
+        agentId: summaryAgentId,
+        mode: questionAware ? "answer" : "summary",
+        isGroup,
+        groupId,
+        userId,
+        imageRefs: imageUrls,
+      }),
       inputText: multimodalText,
       imageUrls,
     });
@@ -471,11 +486,11 @@ async function extractMessagePayload(msg: OneBotMessage, maxImageCount: number, 
 
   const userText = getTextFromSegments(msg);
   try {
-    const cachedQuotedImages = getCachedMessageMedia(replyId);
+    const cachedQuotedImages = getCachedMessageMediaEntries(replyId);
     const quoted = await getMsg(replyId);
     const quotedText = quoted ? getTextFromMessageContent(quoted.message) : "";
-    let quotedImageUrls = cachedQuotedImages;
-    if (quotedImageUrls.length === 0) {
+    let quotedImageEntries = cachedQuotedImages;
+    if (quotedImageEntries.length === 0) {
       const quotedRawImageUrls = Array.from(new Set([
         ...(quoted ? getImageUrlsFromMessageContent(quoted.message) : []),
         ...(quoted ? getImageUrlsFromMessageContent((quoted as any)?.raw_message as string | undefined) : []),
@@ -484,11 +499,18 @@ async function extractMessagePayload(msg: OneBotMessage, maxImageCount: number, 
       api?.logger?.info?.(
         `[napcat] reply image extraction replyId=${replyId} cache=0 messageType=${Array.isArray(quoted?.message) ? "array" : typeof quoted?.message} rawType=${typeof (quoted as any)?.raw_message} extracted=${quotedRawImageUrls.length}`,
       );
-      quotedImageUrls = await materializeImageRefs(quotedRawImageUrls);
-      rememberMessageMedia(replyId, quotedImageUrls);
+      quotedImageEntries = await materializeImageRefEntries(quotedRawImageUrls);
+      rememberMessageMediaEntries(replyId, quotedImageEntries);
     } else {
-      api?.logger?.info?.(`[napcat] reply image extraction replyId=${replyId} cacheHit=${quotedImageUrls.length}`);
+      api?.logger?.info?.(`[napcat] reply image extraction replyId=${replyId} cacheHit=${quotedImageEntries.length}`);
     }
+    const quotedImageUrls = quotedImageEntries
+      .map((entry) => {
+        const source = String(entry.source ?? "").trim();
+        if (/^https?:\/\//i.test(source)) return source;
+        return entry.resolved || source;
+      })
+      .filter(Boolean);
     const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
     const text = quotedText.trim()
       ? `[引用 ${String(senderLabel)} 的消息：${quotedText.trim()}]\n${userText}`
@@ -512,13 +534,26 @@ async function materializeImageRefs(refs: string[]): Promise<string[]> {
     .filter(Boolean);
 }
 
+async function materializeImageRefEntries(refs: string[]): Promise<Array<{ source: string; resolved: string }>> {
+  const results = await Promise.allSettled(refs.map((ref) => resolveMediaToBase64Cached(ref)));
+  return refs
+    .map((ref, idx) => {
+      const result = results[idx];
+      return {
+        source: String(ref ?? "").trim(),
+        resolved: result?.status === "fulfilled" ? String(result.value ?? "").trim() : "",
+      };
+    })
+    .filter((entry) => entry.source || entry.resolved);
+}
+
 async function primeInboundImageCache(msg: OneBotMessage): Promise<void> {
   const imageRefs = getImageUrls(msg);
   if (!Array.isArray(imageRefs) || imageRefs.length === 0 || msg.message_id == null) return;
-  const cached = getCachedMessageMedia(msg.message_id);
+  const cached = getCachedMessageMediaEntries(msg.message_id);
   if (cached.length > 0) return;
-  const materialized = await materializeImageRefs(imageRefs);
-  rememberMessageMedia(msg.message_id, materialized);
+  const materialized = await materializeImageRefEntries(imageRefs);
+  rememberMessageMediaEntries(msg.message_id, materialized);
 }
 
 // ─────────────────────────────────────────────
@@ -541,6 +576,8 @@ async function dispatchToAI(
     isPeriodicCheck?: boolean;
     replyCheckpointTs?: number;
     staleGroupActivityVersion?: number;
+    stalePeriodicLastMessageId?: number;
+    stalePeriodicLastSenderName?: string;
   },
 ): Promise<void> {
   const {
@@ -602,6 +639,8 @@ async function dispatchToAIPersona(
     isPeriodicCheck?: boolean;
     replyCheckpointTs?: number;
     staleGroupActivityVersion?: number;
+    stalePeriodicLastMessageId?: number;
+    stalePeriodicLastSenderName?: string;
   },
   dispatchMeta: {
     accountId: string;
@@ -616,6 +655,8 @@ async function dispatchToAIPersona(
     userId, groupId, isGroup, senderName,
     messageText, messageId, replyCheckpointTs,
     staleGroupActivityVersion,
+    stalePeriodicLastMessageId,
+    stalePeriodicLastSenderName,
   } = opts;
   if (!isGroup || groupId == null) {
     throw new Error("persona mode is currently supported for group turns only");
@@ -681,6 +722,10 @@ async function dispatchToAIPersona(
       senderName,
       replyTarget: `napcat:group:${groupId}`,
     });
+    if (personaResult.status === "deferred") {
+      api.logger?.info?.(`[napcat] persona-core deferred followup for group ${groupId}`);
+      return;
+    }
     if (personaResult.status === "approval-pending" || personaResult.status === "approval-unavailable") {
       const pendingText = buildPersonaPendingReply(personaResult.status);
       registerPendingApprovalSurface(`group:${groupId}`, {
@@ -710,8 +755,16 @@ async function dispatchToAIPersona(
     const turn = normalizePersonaTurn(personaRaw);
 
     if (staleGroupActivityVersion != null && getGroupActivityVersion(groupId) !== staleGroupActivityVersion) {
-      api.logger?.info?.(`[napcat] suppressing stale persona turn for group ${groupId}`);
-      return;
+      const staleDecision = evaluatePeriodicStaleHeuristic({
+        groupId,
+        baselineMessageId: stalePeriodicLastMessageId,
+        baselineSenderName: stalePeriodicLastSenderName,
+      });
+      if (staleDecision.suppress) {
+        api.logger?.info?.(`[napcat] suppressing stale persona turn for group ${groupId}: ${staleDecision.reason}`);
+        return;
+      }
+      api.logger?.info?.(`[napcat] allowing stale persona turn for group ${groupId}: ${staleDecision.reason}`);
     }
 
     const personaAction = turn.decision.action;
@@ -766,29 +819,50 @@ async function dispatchToAIPersona(
         api.logger?.info?.(
           `[napcat] ▶ voice-organ turn for group ${groupId}, voiceAgent=${voiceAgentId}, voiceSession=${voiceSessionKey}`,
         );
-        const voicedResult = await runAgentTextViaRuntime(api, {
-          runtime,
-          cfg,
-          agentId: voiceAgentId,
-          sessionKey: voiceSessionKey,
-          inputText: voiceInput,
-          userId,
-          groupId,
-          isGroup,
-          senderName,
-          replyTarget: `napcat:group:${groupId}`,
-        });
-        const voicedRaw = voicedResult.finalText;
-        const voiced = normalizeVoiceText(voicedRaw);
-        if (voiced.trim()) finalReply = voiced.trim();
+        const gatewayPort = cfg?.gateway?.port ?? 18789;
+        const gatewayToken = String(cfg?.gateway?.auth?.token ?? "").trim();
+        if (gatewayToken) {
+          const voiced = await requestVoiceTurn({
+            gatewayPort,
+            gatewayToken,
+            agentId: voiceAgentId,
+            sessionKey: voiceSessionKey,
+            inputText: voiceInput,
+          });
+          if (voiced.trim()) finalReply = voiced.trim();
+        } else {
+          const voicedResult = await runAgentTextViaRuntime(api, {
+            runtime,
+            cfg,
+            agentId: voiceAgentId,
+            sessionKey: voiceSessionKey,
+            inputText: voiceInput,
+            userId,
+            groupId,
+            isGroup,
+            senderName,
+            replyTarget: `napcat:group:${groupId}`,
+          });
+          const voicedRaw = voicedResult.finalText;
+          const voiced = normalizeVoiceText(voicedRaw);
+          if (voiced.trim()) finalReply = voiced.trim();
+        }
       } catch (err: any) {
         api.logger?.warn?.(`[napcat] voice-organ failed, using persona-core text: ${err?.message}`);
       }
     }
 
     if (staleGroupActivityVersion != null && getGroupActivityVersion(groupId) !== staleGroupActivityVersion) {
-      api.logger?.info?.(`[napcat] suppressing stale persona reply for group ${groupId}`);
-      return;
+      const staleDecision = evaluatePeriodicStaleHeuristic({
+        groupId,
+        baselineMessageId: stalePeriodicLastMessageId,
+        baselineSenderName: stalePeriodicLastSenderName,
+      });
+      if (staleDecision.suppress) {
+        api.logger?.info?.(`[napcat] suppressing stale persona reply for group ${groupId}: ${staleDecision.reason}`);
+        return;
+      }
+      api.logger?.info?.(`[napcat] allowing stale persona reply for group ${groupId}: ${staleDecision.reason}`);
     }
 
     await clearEmoji();
@@ -1080,6 +1154,13 @@ async function maybeSummarizeGroupImagesToHistory(
     gatewayPort: cfg?.gateway?.port ?? 18789,
     gatewayToken: cfg?.gateway?.auth?.token ?? "",
     agentId: summaryAgentId,
+    sessionKey: buildVisionSessionKey({
+      agentId: summaryAgentId,
+      mode: "summary",
+      isGroup: true,
+      groupId,
+      imageRefs: imageRefs,
+    }),
     inputText: buildVisionSummaryPrompt(imageRefs.length),
     imageUrls: imageRefs,
   });
@@ -1099,7 +1180,7 @@ async function deliverNapCatPayload(params: {
   const p = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
   const replyText = typeof p === "string" ? p : (p?.text ?? p?.body ?? "");
   const mediaUrl = typeof p === "string" ? undefined : (p?.mediaUrl ?? p?.mediaUrls?.[0]);
-  const trimmed = (replyText || "").trim();
+  const trimmed = normalizeOutboundReplyText((replyText || "").trim());
 
   api.logger?.info?.(`[napcat] ▶ AI reply (kind=${info.kind}): text="${trimmed.slice(0, 120)}" mediaUrl=${mediaUrl ?? "none"}`);
 
@@ -1529,6 +1610,7 @@ async function maybeBuildSectionImageContext(
   opts: {
     cfg: any;
     napCatCfg: any;
+    groupId: number;
     contextSource: Array<{ senderName: string; body: string; timestamp: number }>;
     recentMessages: Array<{ senderName: string; body: string; timestamp: number }>;
   },
@@ -1548,6 +1630,13 @@ async function maybeBuildSectionImageContext(
     gatewayPort: opts.cfg?.gateway?.port ?? 18789,
     gatewayToken: opts.cfg?.gateway?.auth?.token ?? "",
     agentId: summaryAgentId,
+    sessionKey: buildVisionSessionKey({
+      agentId: summaryAgentId,
+      mode: "answer",
+      isGroup: true,
+      groupId: opts.groupId,
+      imageRefs,
+    }),
     inputText: buildVisionQuestionPrompt(questionText, imageRefs.length),
     imageUrls: imageRefs,
   });
@@ -1564,6 +1653,48 @@ function collectImageRefsFromEntries(entries: Array<{ body: string }>): string[]
     }
   }
   return Array.from(refs).slice(0, 3);
+}
+
+function buildVisionSessionKey(params: {
+  agentId: string;
+  mode: "summary" | "answer";
+  isGroup: boolean;
+  groupId?: number;
+  userId?: number;
+  imageRefs: string[];
+}): string {
+  const scope = params.isGroup
+    ? `group:${String(params.groupId ?? "unknown")}`
+    : `user:${String(params.userId ?? "unknown")}`;
+  return `agent:${params.agentId}:vision:${params.mode}:${scope}`.toLowerCase();
+}
+
+function evaluatePeriodicStaleHeuristic(params: {
+  groupId: number;
+  baselineMessageId?: number;
+  baselineSenderName?: string;
+}): { suppress: boolean; reason: string } {
+  const baselineMessageId = Number(params.baselineMessageId ?? 0);
+  const baselineSenderName = String(params.baselineSenderName ?? "").trim();
+  if (!baselineMessageId || !baselineSenderName) {
+    return { suppress: true, reason: "missing-baseline" };
+  }
+
+  const newMessages = getGroupMessagesAfterId(params.groupId, baselineMessageId, 8);
+  if (newMessages.length === 0) {
+    return { suppress: true, reason: "stale-without-visible-new-messages" };
+  }
+
+  const sameSenderFollowup = newMessages.some((message) => sameSenderName(message.senderName, baselineSenderName));
+  if (sameSenderFollowup) {
+    return { suppress: true, reason: "same-sender-followup" };
+  }
+
+  return { suppress: false, reason: "interleaving-other-speaker" };
+}
+
+function sameSenderName(left: string, right: string): boolean {
+  return String(left ?? "").trim() !== "" && String(left ?? "").trim() === String(right ?? "").trim();
 }
 
 function extractReplyAnchorText(...candidates: Array<string | undefined>): string {

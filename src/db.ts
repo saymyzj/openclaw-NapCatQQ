@@ -106,6 +106,16 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_followup_jobs_target_fingerprint ON followup_jobs(target_key, raw_fingerprint, delivered_at);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS message_media_cache (
+    message_key TEXT PRIMARY KEY,
+    values_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_message_media_cache_updated ON message_media_cache(updated_at);
+`);
+
 const checkpointColumns = db.prepare(`PRAGMA table_info(checkpoints)`).all() as Array<{ name: string }>;
 const checkpointColumnNames = new Set(checkpointColumns.map((col) => col.name));
 if (!checkpointColumnNames.has("last_reply_ts")) {
@@ -294,6 +304,11 @@ export interface FollowupJob {
   expires_at: number;
 }
 
+export interface MessageMediaCacheEntry {
+  source: string;
+  resolved: string;
+}
+
 // Insert a message
 export function insertGroupMessage(groupId: number, senderName: string, content: string) {
   // Ensure types match sqlite schema to avoid datatype mismatch
@@ -356,6 +371,30 @@ export function getMessagesSinceLastReply(groupId: number, limit: number = 100):
   const stmt = db.prepare('SELECT * FROM messages WHERE group_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT ?');
   const rows = stmt.all(nGroupId, lastReplyTs, Number(limit)) as unknown as DbMessage[];
   return rows.reverse(); // Return in ascending chronological order
+}
+
+export function getGroupMessagesAfterTimestamp(groupId: number, afterTs: number, limit: number = 20): DbMessage[] {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM messages
+    WHERE group_id = ?
+      AND timestamp > ?
+    ORDER BY timestamp ASC
+    LIMIT ?
+  `);
+  return stmt.all(Number(groupId), Number(afterTs), Number(limit)) as unknown as DbMessage[];
+}
+
+export function getGroupMessagesAfterId(groupId: number, afterId: number, limit: number = 20): DbMessage[] {
+  const stmt = db.prepare(`
+    SELECT *
+    FROM messages
+    WHERE group_id = ?
+      AND id > ?
+    ORDER BY id ASC
+    LIMIT ?
+  `);
+  return stmt.all(Number(groupId), Number(afterId), Number(limit)) as unknown as DbMessage[];
 }
 
 // Clean up old messages (keep only the most recent 500)
@@ -434,6 +473,64 @@ export function updateGroupReplyAnchor(
       last_bot_reply_excerpt = excluded.last_bot_reply_excerpt
   `);
   stmt.run(nGroupId, replyTs, nGroupId, replyText, excerpt);
+}
+
+export function upsertMessageMediaCache(
+  messageKey: string,
+  entries: MessageMediaCacheEntry[],
+  now: number = Date.now(),
+): void {
+  const normalizedKey = String(messageKey ?? "").trim();
+  if (!normalizedKey) return;
+  const normalizedEntries = entries
+    .map((entry) => ({
+      source: String(entry?.source ?? "").trim(),
+      resolved: String(entry?.resolved ?? "").trim(),
+    }))
+    .filter((entry) => entry.source || entry.resolved);
+  if (normalizedEntries.length === 0) return;
+
+  const stmt = db.prepare(`
+    INSERT INTO message_media_cache (message_key, values_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(message_key) DO UPDATE SET
+      values_json = excluded.values_json,
+      updated_at = excluded.updated_at
+  `);
+  stmt.run(normalizedKey, JSON.stringify(normalizedEntries), Number(now), Number(now));
+}
+
+export function getMessageMediaCache(messageKey: string): MessageMediaCacheEntry[] {
+  const normalizedKey = String(messageKey ?? "").trim();
+  if (!normalizedKey) return [];
+  const stmt = db.prepare(`
+    SELECT values_json
+    FROM message_media_cache
+    WHERE message_key = ?
+    LIMIT 1
+  `);
+  const row = stmt.get(normalizedKey) as { values_json?: string } | undefined;
+  if (!row?.values_json) return [];
+  try {
+    const parsed = JSON.parse(row.values_json) as MessageMediaCacheEntry[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((entry) => ({
+        source: String(entry?.source ?? "").trim(),
+        resolved: String(entry?.resolved ?? "").trim(),
+      }))
+      .filter((entry) => entry.source || entry.resolved);
+  } catch {
+    return [];
+  }
+}
+
+export function cleanupOldMessageMediaCache(cutoffTs: number): void {
+  const stmt = db.prepare(`
+    DELETE FROM message_media_cache
+    WHERE updated_at > 0 AND updated_at < ?
+  `);
+  stmt.run(Number(cutoffTs));
 }
 
 export function getGroupReplyAnchor(groupId: number): GroupReplyAnchor | null {

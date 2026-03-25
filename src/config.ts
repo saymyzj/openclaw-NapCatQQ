@@ -48,7 +48,7 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
             reflectionIntervalMs: Math.max(60_000, Number(channel.maintenance.reflectionIntervalMs ?? 43_200_000)),
             reflectionBatchSize: Math.max(1, Number(channel.maintenance.reflectionBatchSize ?? 5)),
             dailyMemoryEnabled: channel.maintenance.dailyMemoryEnabled !== false,
-            dailyMemoryIntervalMs: Math.max(60_000, Number(channel.maintenance.dailyMemoryIntervalMs ?? 900_000)),
+            dailyMemoryIntervalMs: Math.max(60_000, Number(channel.maintenance.dailyMemoryIntervalMs ?? 14_400_000)),
             dailyMemoryBatchSize: Math.max(1, Number(channel.maintenance.dailyMemoryBatchSize ?? 2)),
           }
         : {
@@ -57,7 +57,7 @@ export function getNapCatConfig(api: any, accountId?: string): NapCatConfig | nu
             reflectionIntervalMs: 43_200_000,
             reflectionBatchSize: 5,
             dailyMemoryEnabled: true,
-            dailyMemoryIntervalMs: 900_000,
+            dailyMemoryIntervalMs: 14_400_000,
             dailyMemoryBatchSize: 2,
           },
       whitelistUserIds: channel.whitelistUserIds ?? [],

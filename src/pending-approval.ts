@@ -133,40 +133,56 @@ async function tryRuntimeFollowup(opts: {
   }
 
   try {
-    const voiceResult = await runAgentTextViaRuntime(api, {
-      runtime,
-      cfg: opts.cfg,
-      agentId: opts.pending.voice_agent_id || "voice-organ",
-      sessionKey: opts.pending.voice_session_key || `agent:voice-organ:surface:group:${opts.pending.group_id}`,
-      inputText: [
-        "<operating_mode>surface</operating_mode>",
-        "",
-        "<chat_context_excerpt>",
-        opts.pending.chat_context_excerpt,
-        "</chat_context_excerpt>",
-        "",
-        "<persona_packet>",
-        JSON.stringify({
-          draft: {
-            reply_to: "current",
-            core_text: finalText,
-          },
-        }, null, 2),
-        "</persona_packet>",
-        "",
-        "<task>",
-        "请把这句审批完成后的群聊回复改写成更自然、更像群友的一句话。",
-        "不要新增未经确认的细节。",
-        "请只输出 voice-organ.turn.v2 JSON。",
-        "</task>",
-      ].join("\n"),
-      userId: 0,
-      groupId: opts.pending.group_id,
-      isGroup: true,
-      senderName: "approval-followup",
-      replyTarget: `napcat:group:${opts.pending.group_id}`,
-    });
-    const voiced = normalizeVoiceText(voiceResult.finalText);
+    const voiceInput = [
+      "<operating_mode>surface</operating_mode>",
+      "",
+      "<chat_context_excerpt>",
+      opts.pending.chat_context_excerpt,
+      "</chat_context_excerpt>",
+      "",
+      "<persona_packet>",
+      JSON.stringify({
+        draft: {
+          reply_to: "current",
+          core_text: finalText,
+        },
+      }, null, 2),
+      "</persona_packet>",
+      "",
+      "<task>",
+      "请把这句审批完成后的群聊回复改写成更自然、更像群友的一句话。",
+      "不要新增未经确认的细节。",
+      "请只输出 voice-organ.turn.v2 JSON。",
+      "</task>",
+    ].join("\n");
+
+    const gatewayPort = opts.cfg?.gateway?.port ?? 18789;
+    const gatewayToken = String(opts.cfg?.gateway?.auth?.token ?? "").trim();
+    let voiced = "";
+    if (gatewayToken) {
+      voiced = await requestVoiceTurn({
+        gatewayPort,
+        gatewayToken,
+        agentId: opts.pending.voice_agent_id || "voice-organ",
+        sessionKey: opts.pending.voice_session_key || `agent:voice-organ:surface:group:${opts.pending.group_id}`,
+        inputText: voiceInput,
+        timeoutMs: 60_000,
+      });
+    } else {
+      const voiceResult = await runAgentTextViaRuntime(api, {
+        runtime,
+        cfg: opts.cfg,
+        agentId: opts.pending.voice_agent_id || "voice-organ",
+        sessionKey: opts.pending.voice_session_key || `agent:voice-organ:surface:group:${opts.pending.group_id}`,
+        inputText: voiceInput,
+        userId: 0,
+        groupId: opts.pending.group_id,
+        isGroup: true,
+        senderName: "approval-followup",
+        replyTarget: `napcat:group:${opts.pending.group_id}`,
+      });
+      voiced = normalizeVoiceText(voiceResult.finalText);
+    }
     if (voiced.trim()) finalText = voiced.trim();
   } catch {
     // fall back to persona text
